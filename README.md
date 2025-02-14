@@ -1,6 +1,6 @@
 # 🧠 **Adaptive Research Assistant** (OpenDeepResearcher) 🚀  
 **Version:** 1.0  
-**Author:** Matt Shumer *(with modifications to optimize research methodology across domains)*  
+Based on Original OpenDeepResearcher by Matt Shumer  
 
 ---
 
