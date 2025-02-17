@@ -1,173 +1,176 @@
-# 🧠 **Adaptive Research Assistant** (OpenDeepResearcher) 🚀  
-**Version:** 1.0  
-Based on Original OpenDeepResearcher by Matt Shumer  
+  # 🧠 AI-Driven Research Assistant 2.0
 
----
+ An autonomous research platform that leverages large language models in agentic fashion to decompose complex research queries into structured investigations, automatically gathering and synthesizing findings from academic and scientific sources.
 
-## 📖 **Introduction**  
+ ## 🎯 Core Value
 
-The **Adaptive Research Assistant** is an advanced, self-optimizing research tool designed to streamline, accelerate, and refine the process of gathering, analyzing, and synthesizing information from the web.  
+ This system autonomously:
+ - Decomposes research queries into investigatable aspects
+ - Executes concurrent searches across academic sources
+ - Evaluates source credibility and evidence quality 
+ - Synthesizes findings into comprehensive reports
+ - Identifies contradictions and knowledge gaps
 
-Unlike traditional research automation scripts, this assistant:  
-- **Dynamically generates research questions** based on high-level goals.  
-- **Refines queries iteratively** to maximize information yield.  
-- **Scores content relevance** before extraction to save time and resources.  
-- **Synthesizes a comprehensive final report** based on extracted context.  
-- **Learns from feedback** to improve performance over time.  
----
+ ## 🔍 How It Works
 
-## ⚙️ **How It Works**  
+ ### 1. Research Decomposition
+ The assistant analyzes your research query and breaks it into distinct aspects:
 
-1. **Input:** You provide a single high-level research goal.  
-2. **Ontology Builder:** The assistant generates a structured topic tree and a single-paragraph query input.  
-3. **Query Execution:** It sends generated queries to SERPAPI and retrieves webpage text using Jina AI.  
-4. **Relevance Scoring:** The assistant evaluates webpage content for relevance and extracts key information if deemed useful.  
-5. **Adaptive Refinement:** The assistant asks the LLM to generate refined queries if more information is needed.  
-6. **Report Generation:** It synthesizes a clear, concise, and comprehensive research report.  
-7. **Feedback Loop:** Query performance is tracked, enabling long-term optimization.  
+ ```python
+ query = """Investigate the relationship between environmental factors 
+           (temperature, air quality) and public health metrics in 
+           urban environments over the past decade."""
 
----
+ ## System automatically identifies aspects like:
+ # - Environmental measurements
+ # - Public health statistics
+ # - Urban demographics
+ # - Temporal patterns
 
-## 🔍 **Example Use Case**  
+ ### 2. Concurrent Investigation
+ For each aspect, the system:
+ - Generates targeted search queries
+ - Retrieves and evaluates academic sources
+ - Extracts relevant findings
+ - Tracks evidence quality
+ - Identifies contradictions
 
-**Research Goal:** *"Investigate the relationship between cosmic activity and human behavior."*  
+ ### 3. Dynamic Coverage Analysis
+ The assistant:
+ - Monitors research progress per aspect
+ - Adjusts queries based on findings
+ - Identifies knowledge gaps
+ - Ensures comprehensive coverage
+ - Validates findings across sources
 
-The assistant will:  
-- Create a research roadmap with subtopics like geomagnetic influences, lunar cycles, and biological rhythms.  
-- Generate search queries, retrieve relevant articles, and synthesize insights.  
-- Provide a final report detailing correlations, mechanisms, and practical applications.  
+ ### 4. Report Generation
+ Produces a structured report with:
+ - Executive summary
+ - Key findings by aspect
+ - Evidence quality analysis
+ - Contradictory evidence
+ - Critical gaps
+ - High-impact studies
 
----
+ ## ⚙️ Setup
 
-## 🛠️ **Setup Guide**  
+ ### Requirements
+ - Python 3.8+
+ - API Keys:
+   * OpenRouter (LLM queries)
+   * SERPAPI (Academic search)
+   * JINA (Content extraction)
 
-### 1️⃣ **Install Requirements**  
+ ### Installation
+ ```bash
+ git clone https://github.com/angeledsa2/OpenDeepResearcher-Fork.git
+ cd OpenDeepResearcher-Fork
+ ```
 
-```bash
-pip install nest_asyncio aiohttp
-```
+ ### Configure API Keys
+ ```bash
+ export OPENROUTER_API_KEY="your_key"
+ export SERPAPI_API_KEY="your_key"
+ export JINA_API_KEY="your_key"
+ ```
 
-*(Additional dependencies like OpenRouter, SERPAPI, and Jina are API-based and don't require separate installations.)*  
 
----
+ ## 💻 Usage
 
-### 2️⃣ **Environment Variables**  
+ # Basic research:
+ ```python
+ from research_assistant import ResearchAssistant
 
-Before running the assistant, set the following environment variables:  
+ # Initialize assistant
+ assistant = ResearchAssistant()
 
-```bash
-export OPENROUTER_API_KEY="your_openrouter_api_key"
-export SERPAPI_API_KEY="your_serpapi_api_key"
-export JINA_API_KEY="your_jina_api_key"
-```
+ # Define research goal
+ goal = """Analyze the impact of remote work adoption on 
+           organizational productivity and employee well-being 
+           across different industries."""
 
----
+ # Execute research
+ result = await assistant.conduct_research(goal)
+ print(result)
+ ```
 
-### 3️⃣ **API Key Acquisition**  
+ # Advanced configuration:
+ ```python
+ assistant = ResearchAssistant(
+     max_concurrent_requests=5,  # Parallel search limit
+     default_model="anthropic/claude-3.5-sonnet",  # LLM model
+     min_evidence_quality=7  # Minimum source quality (1-10)
+ )
 
-| **API**       | **Website**                             | **Notes**                          |
-|----------------|----------------------------------------|------------------------------------|
-| OpenRouter    | [openrouter.ai](https://openrouter.ai/)  | GPT-based query generation         |
-| SERPAPI       | [serpapi.com](https://serpapi.com/)      | Google Search API                  |
-| Jina AI       | [jina.ai](https://jina.ai/)              | Webpage content retrieval          |
+ # Example complex query
+ goal = """Examine the effectiveness of different machine learning 
+           approaches in early disease detection using medical imaging, 
+           including validation studies and performance metrics."""
 
----
+ result = await assistant.conduct_research(goal)
+ ```
+ ## Advanced configuration:
+ ```python
+ assistant = ResearchAssistant(
+     max_concurrent_requests=5,  # Parallel search limit
+     default_model="anthropic/claude-3.5-sonnet",  # LLM model
+     min_evidence_quality=7  # Minimum source quality (1-10)
+ )
+ ```
+ ## 🔧 Key Parameters
 
-### 4️⃣ **Running the Assistant**  
+ - MAX_CONCURRENT_REQUESTS: Controls parallel processing (default: 5)
+ - DEFAULT_MODEL: OpenRouter model selection
+ - min_evidence_quality: Minimum source quality threshold (1-10)
+ - coverage_threshold: Required coverage per aspect (0-100%)
 
-Run the script by executing:  
+ ## 📊 Output Format
 
-```bash
-python adaptive_research_assistant.py
-```
+ The assistant generates a structured markdown report:
+ ```markdown
+ # Research Report
 
----
+ ## Executive Summary
+ [Key findings across all aspects]
 
-## 🎯 **Usage Instructions**  
+ ## Findings by Research Aspect
+ [Detailed findings for each aspect]
 
-The assistant will prompt you for:  
+ ## Evidence Quality Analysis
+ [Source credibility assessment]
 
-1. **High-Level Research Goal:** *(e.g., "Investigate the effects of geomagnetic activity on human health.")*  
-2. **Maximum Iterations:** *(Limits how long the assistant will search for new insights.)*  
+ ## Contradictory Evidence
+ [Conflicting findings]
 
-The assistant will then:  
-- Generate queries  
-- Conduct searches  
-- Analyze and extract content  
-- Produce a final report  
+ ## Critical Gaps
+ [Areas needing further research]
 
----
+ ## High-Impact Studies
+ [Most significant sources]
+ ```
 
-## 🧠 **Customization & Advanced Configuration**  
+ ## ⚠️ Limitations
 
-### 🧩 **Adaptive Query Refinement**  
+ - Requires valid API keys
+ - 5000 character limit per source
+ - English language sources only
+ - Output length constraints
+ - API rate limits apply
 
-The assistant refines its queries based on context extraction. You can tweak this behavior via:  
+ ## 🤝 Contributing
 
-```python
-MAX_ITERATIONS = 7  # Adjust for longer/shorter research loops
-```
+ Visit github.com/angeledsa2/OpenDeepResearcher-Fork to:
+ - Report issues
+ - Submit feature requests
+ - Contribute improvements
 
-### 🔧 **Topic Tree Depth**  
+ ## 📜 License
 
-The initial topic tree is generated with 3 levels by default. To adjust, modify:  
+ MIT License - See LICENSE.md
 
-```python
-"generate:\n- A hierarchical topic tree with 3 levels.\n"
-```
+ ---
 
-### 🎚️ **Relevance Threshold**  
+ Original Concept: Based on OpenDeepResearcher by Matt Shumer
+ Fork Maintainer: @angeledsa2
 
-The assistant filters content with a relevance score ≥ 6. Adjust by modifying:  
-
-```python
-if "Score:" in r and int(r.split("Score:")[1][:1]) >= 6:
-```
-
----
-
-## 🚧 **Known Limitations**  
-
-- **API Dependency:** Requires consistent availability of OpenRouter, SERPAPI, and Jina services.  
-- **Relevance Evaluation Noise:** Relevance scoring may occasionally misclassify pages; manual review is advised for critical research.  
-- **Text Length Constraints:** Extracted content is truncated at 20,000 characters for processing efficiency.  
-
----
-
-## 🔍 **Potential Improvements** *(Future Scope)*  
-
-- 🧠 **Machine Learning Integration:** Track past query performance to optimize new query generation.  
-- 🔄 **Recurrent Query Looping:** Introduce a semi-supervised feedback mechanism for higher accuracy.  
-- 🌐 **Multi-Language Support:** Adapt for research in multiple languages.  
-
----
-
-## 📊 **Practical Applications**  
-
-1. **Scientific Literature Reviews:** Discover patterns across publications.  
-2. **Market Intelligence:** Analyze trends, competitors, and customer sentiment.  
-4. **Technological Scouting:** Track emerging innovations and patents.  
-
----
-
-## 🎯 **Tips for Maximizing Research Efficiency**  
-
-1. **Be Specific:** The more precise the goal, the better the results.  
-2. **Monitor Query Quality:** Adjust maximum iterations based on desired depth.  
-3. **Regularly Rotate APIs:** Avoid hitting rate limits by rotating keys across multiple accounts if needed.  
-4. **Cross-Validate Findings:** Use the assistant as a starting point, not a final decision-making tool.  
-
----
-
-## 🤝 **Collaborative Potential**  
-
-The modular architecture allows for:  
-- Plugging in new APIs  
-- Domain-specific research enhancements  
-- Integration with analytics platforms  
-
-This flexibility ensures that the Adaptive Research Assistant remains valuable even as research goals evolve.  
-
----
-
-💡 **Happy Researching!** 🌐
+ > Note: This is an autonomous research tool. Always verify critical findings through additional sources.
