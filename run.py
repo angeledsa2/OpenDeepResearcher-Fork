@@ -1,785 +1,1134 @@
 import asyncio
 import aiohttp
 import json
-from bs4 import BeautifulSoup
 import re
+from typing import Dict, List, Optional
+import os
+from datetime import datetime
+
+# If running in an environment with an already-running event loop (e.g. Jupyter/Colab), patch it.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
 
 # Configuration
-OPENROUTER_API_KEY = ""
-SERPAPI_API_KEY = ""
-JINA_API_KEY = ""
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', "")
+SERPAPI_API_KEY = os.getenv('SERPAPI_API_KEY', "")
+JINA_API_KEY = os.getenv('JINA_API_KEY', "")
+JINA_BASE_URL = "https://r.jina.ai/"
+DEFAULT_MODEL = "anthropic/claude-3.5-sonnet"
+MAX_CONCURRENT_REQUESTS = 5
 
+# Endpoints
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 SERPAPI_URL = "https://serpapi.com/search"
 JINA_BASE_URL = "https://r.jina.ai/"
 
-DEFAULT_MODEL = "anthropic/claude-3.5-sonnet"
-MAX_CONCURRENT_REQUESTS = 5
+class PaywallException(Exception):
+    """Custom exception for paywall detection"""
+    def __init__(self, url: str, reason: str):
+        self.url = url
+        self.reason = reason
+        self.message = f"Paywall detected at {url}: {reason}"
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return f"🔒 Paywall at {self.url} (reason: {self.reason})"
+
+    def get_details(self) -> Dict:
+        return {
+            "url": self.url,
+            "reason": self.reason,
+            "timestamp": datetime.now().isoformat()
+        }
 
 class ResearchAssistant:
     def __init__(self):
-        # Initialize research state with additional mapping for query results.
-        self.research_state = {
-            "original_request": None,
-            "research_aspects": {},
-            "findings_by_aspect": {},
-            "aspect_coverage": {},
-            "aspect_queries": {},
-            "findings": [],
-            "queries_attempted": set(),
-            "successful_queries": [],
-            "query_results": {},  # New mapping: query -> list of evaluations
-            "coverage_analysis": {},
-            "gaps_identified": set(),
-            "papers_found": [],
-            "null_results": [],
-            "source_credibility_scores": {},
-            "keyword_cache": {},
-            "significant_studies": {
+        """Initialize research assistant state."""
+        self.state = {
+            "request": None,
+            "aspects": {},
+            "findings": {},
+            "coverage": {},
+            "studies": {
                 "high_relevance": [],
                 "medium_relevance": [],
                 "contradictory": [],
                 "null_results": []
             },
             "citations": set(),
-            "completed_aspects": set(),
-            "aspect_reports": {},
-            "failed_queries": [],
-            "error_log": [],
-            "emergency_summaries": {}
+            "processed_urls": set(),
+            "errors": [],
+            "research_quality": {
+                "aspect_scores": {},
+                "gaps": set(),
+                "quality_issues": []
+            },
+            "progress": {
+                "queries_attempted": set(),
+                "successful_queries": [],
+                "failed_queries": []
+            }
         }
 
-    async def call_llm(self, session, messages, max_retries=3):
+
+    async def initialize_research(self, session: aiohttp.ClientSession, request: str) -> bool:
+        """Initialize research with LLM analysis."""
+        self.state["request"] = request
+        prompt = (
+            f"Analyze this research request thoroughly:\n{request}\n\n"
+            "Break it down into research aspects, each with:\n"
+            "- Key concepts and search terms\n"
+            "- Required evidence types\n"
+            "- Success criteria\n"
+            "- Credibility requirements\n\n"
+            "Format as JSON with clear aspect names as keys.\n"
+            "Each aspect should have: concepts, evidence_types, criteria, credibility_requirements"
+        )
+        print("DEBUG: Sending the following prompt to LLM for research analysis:")
+        print(prompt)
+        try:
+            analysis = await self._call_llm(session, prompt)
+            if not analysis:
+                print("DEBUG: Received no output from LLM.")
+                return False
+            print("DEBUG: Raw LLM output:")
+            print(analysis)
+            try:
+                plan = json.loads(analysis)
+            except Exception as e:
+                print("DEBUG: JSON parsing failed. Raw response:")
+                print(analysis)
+                raise e
+            self.state["aspects"] = plan
+            for aspect in plan.keys():
+                self.state["findings"][aspect] = []
+                self.state["coverage"][aspect] = 0
+                self.state["research_quality"]["aspect_scores"][aspect] = []
+            return True
+        except Exception as e:
+            self.state["errors"].append(f"Initialization failed: {str(e)}")
+            print(f"❌ Initialization error: {str(e)}")
+            return False
+
+    async def _call_llm(self, session: aiohttp.ClientSession, prompt: str, max_retries: int = 3) -> Optional[str]:
+        """Make LLM API call with robust response handling and retries for overloaded conditions."""
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "HTTP-Referer": "http://localhost:8000",
+            "X-Title": "Research Assistant",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": "You are a precise research assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        }
+        
         for attempt in range(max_retries):
             try:
-                headers = {
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json", 
-                    "HTTP-Referer": "https://localhost:3000",
-                    "X-Title": "Research Assistant"
-                }
-                payload = {"model": DEFAULT_MODEL, "messages": messages}
                 async with session.post(OPENROUTER_URL, headers=headers, json=payload) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-                    error_msg = f"OpenRouter API error: Status {resp.status}"
-                    self.research_state["error_log"].append(error_msg)
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1 * (attempt + 1))
-                        continue
+                        data = await resp.json()
+                        if 'error' in data and data['error'].get('code') == 502:
+                            print(f"⚠️ API overloaded (attempt {attempt + 1}/{max_retries})")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                                continue
+                            return None
+                        if ('choices' in data and len(data['choices']) > 0 and
+                            'message' in data['choices'][0] and 'content' in data['choices'][0]['message']):
+                            return data['choices'][0]['message']['content']
+                        print("⚠️ Unexpected LLM response structure:", data)
+                        return None
+                    elif resp.status == 429:  # Rate limit
+                        print(f"⚠️ Rate limited (attempt {attempt + 1}/{max_retries})")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                    else:
+                        error_text = await resp.text()
+                        print(f"❌ LLM API error: {resp.status} - {error_text}")
+                        return None
             except Exception as e:
-                error_msg = f"Error calling OpenRouter (attempt {attempt + 1}/{max_retries}): {str(e)}"
-                self.research_state["error_log"].append(error_msg)
+                print(f"❌ LLM call failed: {str(e)}")
+                self.state["errors"].append(f"LLM call failed: {str(e)}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
+                    await asyncio.sleep(2 ** attempt)
                     continue
-        return None
-
-    async def _get_llm_response(self, session, prompt, max_retries=3):
-        for attempt in range(max_retries):
-            try:
-                messages = [{"role": "user", "content": prompt}]
-                response = await self.call_llm(session, messages)
-                if response and 'choices' in response:
-                    content = response['choices'][0]['message']['content']
-                    parsed = await self._safe_json_parse(content)
-                    if parsed:
-                        return parsed
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
-            except Exception as e:
-                error_msg = f"Error processing LLM response (attempt {attempt + 1}/{max_retries}): {e}"
-                self.research_state["error_log"].append(error_msg)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1 * (attempt + 1))
-        return None
-
-    async def _safe_json_parse(self, content):
-        if not content:
-            return None
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            try:
-                matches = re.findall(r'```(?:json)?\s([\s\S]*?)\s*```', content)
-                for match in matches:
-                    try:
-                        return json.loads(match)
-                    except:
-                        continue
-                match = re.search(r'\{[\s\S]*\}', content)
-                if match:
-                    return json.loads(match.group(0))
-                match = re.search(r'\[[\s\S]*\]', content)
-                if match:
-                    return json.loads(match.group(0))
-            except Exception as nested_e:
-                error_msg = f"Nested JSON parsing error: {nested_e}"
-                self.research_state["error_log"].append(error_msg)
-        return None
-
-    def _track_significant_study(self, evaluation, url):
-        """Track and categorize significant studies with deduplication."""
-        study_hash = hash(f"{url}_{evaluation.get('citation', '')}")
-        if study_hash in self.research_state.get("processed_studies", set()):
-            return
-        
-        self.research_state.setdefault("processed_studies", set()).add(study_hash)
-        try:
-            study_info = {
-                "url": url,
-                "citation": evaluation.get("citation", ""),
-                "evidence_quality": evaluation.get("source_credibility", 0),
-                "key_findings": [],
-                "limitations": evaluation.get("limitations", []),
-                "methodology": evaluation.get("methodology", "Not specified"),
-                "relevance_scores": {}
-            }
-            for aspect, details in evaluation.get("relevance_by_aspect", {}).items():
-                if details["score"] >= 6:
-                    study_info["key_findings"].extend(details["key_findings"])
-                    study_info["relevance_scores"][aspect] = details["score"]
-            if evaluation.get("contradictory_evidence", False):
-                self.research_state["significant_studies"]["contradictory"].append(study_info)
-            elif evaluation.get("null_result", False):
-                self.research_state["significant_studies"]["null_results"].append(study_info)
-            else:
-                avg_score = sum(study_info["relevance_scores"].values()) / len(study_info["relevance_scores"])
-                if avg_score >= 8:
-                    self.research_state["significant_studies"]["high_relevance"].append(study_info)
-                elif avg_score >= 6:
-                    self.research_state["significant_studies"]["medium_relevance"].append(study_info)
-        except Exception as e:
-            error_msg = f"Error tracking significant study: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-
-    async def _cache_aspect_keywords(self, session, aspects):
-        try:
-            for aspect, details in aspects.items():
-                keywords = set(details.get("key_concepts", []))
-                prompt = (
-                    f"Generate relevant search keywords for research aspect: {aspect}\n"
-                    f"Context: {json.dumps(details, indent=2)}\n"
-                    "Return JSON array of keywords"
-                )
-                response = await self._get_llm_response(session, prompt)
-                if isinstance(response, list):
-                    keywords.update(response)
-                self.research_state["keyword_cache"][aspect] = keywords
-        except Exception as e:
-            error_msg = f"Error caching keywords: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-
-    async def perform_search(self, session, query):
-        try:
-            scholar_params = {
-                "q": query,
-                "api_key": SERPAPI_API_KEY,
-                "engine": "google_scholar",
-                "num": 10
-            }
-            async with session.get(SERPAPI_URL, params=scholar_params) as resp:
-                if resp.status == 200:
-                    results = await resp.json()
-                    if "organic_results" in results:
-                        return [r['link'] for r in results["organic_results"][:5]]
-            sites = "site:edu OR site:org OR site:gov OR site:ac.uk"
-            params = {
-                "q": f"({query}) ({sites})",
-                "api_key": SERPAPI_API_KEY,
-                "engine": "google",
-                "num": 10
-            }
-            async with session.get(SERPAPI_URL, params=params) as resp:
-                if resp.status == 200:
-                    results = await resp.json()
-                    if "organic_results" in results:
-                        return [r['link'] for r in results.get("organic_results", [])[:5]]
-        except Exception as e:
-            error_msg = f"Search error: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-        return []
-
-    async def process_urls(self, session, urls, semaphore):
-        async def process_url(url):
-            try:
-                async with semaphore:
-                    content = await self.fetch_content(session, url)
-                    if content:
-                        return await self.evaluate_content(session, content, url)
-            except Exception as e:
-                error_msg = f"Error processing URL {url}: {str(e)}"
-                self.research_state["error_log"].append(error_msg)
-            return None
-        tasks = [process_url(url) for url in urls]
-        results = await asyncio.gather(*tasks)
-        return [r for r in results if r]
-
-    async def fetch_content(self, session, url):
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    text = await resp.text(encoding='utf-8', errors='replace')
-                    return self.clean_content(text)
-            full_url = f"{JINA_BASE_URL}{url}"
-            async with session.get(full_url, headers={"Authorization": f"Bearer {JINA_API_KEY}"}) as resp:
-                if resp.status == 200:
-                    text = await resp.text(encoding='utf-8', errors='replace')
-                    return self.clean_content(text)
-        except Exception as e:
-            error_msg = f"Error fetching {url}: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-        return None
-
-    def clean_content(self, text):
-        if not text:
-            return None
-        try:
-            soup = BeautifulSoup(text, 'html.parser')
-            content = ' '.join([p.get_text() for p in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])])
-            content = re.sub(r'\s+', ' ', content).strip()
-            return content[:5000]
-        except Exception as e:
-            error_msg = f"Error cleaning content: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            return None
-
-    async def initialize_research(self, session, research_request):
-        self.research_state["original_request"] = research_request
-        prompt = (
-            f"Analyze this research request thoroughly: {research_request}\n\n"
-            "1. Break down the request into distinct research aspects\n"
-            "2. For each aspect, identify:\n"
-            "   - Key concepts and terminology\n"
-            "   - Required evidence types\n"
-            "   - Success criteria\n"
-            "   - Potential data sources\n"
-            "   - Methodological requirements\n"
-            "3. Specify relationships between aspects\n"
-            "4. Define completion criteria for each aspect\n\n"
-            "Return a structured JSON:\n"
-            "{\n"
-            '  "aspects": {\n'
-            '    "aspect_name": {\n'
-            '      "key_concepts": ["concept1", "concept2"],\n'
-            '      "evidence_types": ["type1", "type2"],\n'
-            '      "success_criteria": ["criterion1", "criterion2"],\n'
-            '      "data_sources": ["source1", "source2"],\n'
-            '      "methodology": ["method1", "method2"],\n'
-            '      "completion_criteria": ["criteria1", "criteria2"],\n'
-            '      "related_aspects": ["aspect1", "aspect2"]\n'
-            '    }\n'
-            '  },\n'
-            '  "cross_cutting_themes": ["theme1", "theme2"],\n'
-            '  "priority_order": ["aspect1", "aspect2"]\n'
-            "}"
-        )
-        analysis = await self._get_llm_response(session, prompt)
-        if analysis:
-            try:
-                if "aspects" not in analysis or not analysis["aspects"]:
-                    raise ValueError("Invalid analysis structure: missing or empty aspects")
-                self.research_state["research_aspects"] = analysis
-                for aspect in analysis["aspects"]:
-                    self.research_state["findings_by_aspect"][aspect] = []
-                    self.research_state["aspect_coverage"][aspect] = 0
-                    self.research_state["aspect_queries"][aspect] = set()
-                    self.research_state["emergency_summaries"][aspect] = ""
-                await self._cache_aspect_keywords(session, analysis["aspects"])
-                return analysis
-            except Exception as e:
-                error_msg = f"Error initializing research: {str(e)}"
-                self.research_state["error_log"].append(error_msg)
                 return None
         return None
 
-    async def generate_targeted_queries(self, session):
-        """Generate targeted queries with reduced redundancy."""
-        try:
-            queries = []
-            coverage = self.research_state.get("coverage_analysis", {}).get("coverage_by_aspect", {})
-            
-            # Track query combinations to avoid redundancy
-            used_combinations = set()
-            
-            for aspect, current_coverage in sorted(
-                self.research_state["aspect_coverage"].items(),
-                key=lambda x: x[1]
-            ):
-                if current_coverage < 90:
-                    keywords = self.research_state["keyword_cache"].get(aspect, set())
-                    if keywords:
-                        for kw1, kw2 in itertools.combinations(keywords, 2):
-                            query_combo = frozenset([kw1, kw2])
-                            if query_combo not in used_combinations:
-                                used_combinations.add(query_combo)
-                                query = f"{kw1} AND {kw2}"
-                                if query not in self.research_state["queries_attempted"]:
-                                    queries.append({
-                                        "query": query,
-                                        "aspect": aspect,
-                                        "type": "keyword",
-                                        "targets": [aspect]
-                                    })
-            
-            return queries[:5]  # Limit to 5 most promising queries
-            
-        except Exception as e:
-            error_msg = f"Error generating targeted queries: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            print(error_msg)
-            return []
-
-    async def assess_coverage(self, session):
-        try:
-            prompt = (
-                "Analyze current research coverage:\n\n"
-                f"Original Request: {self.research_state['original_request']}\n\n"
-                f"Research Aspects: {json.dumps(self.research_state['research_aspects'], indent=2)}\n\n"
-                f"Findings by Aspect: {json.dumps(self.research_state['findings_by_aspect'], indent=2)}\n\n"
-                f"Current Coverage: {json.dumps(self.research_state['aspect_coverage'], indent=2)}\n\n"
-                "Return a detailed JSON analysis:\n"
-                "{\n"
-                '  "coverage_by_aspect": {\n'
-                '    "aspect_name": {\n'
-                '      "coverage_percentage": 0-100,\n'
-                '      "evidence_quality": 1-10,\n'
-                '      "missing_elements": ["element1", "element2"],\n'
-                '      "contradictions": ["contradiction1", "contradiction2"],\n'
-                '      "confidence_level": 1-10\n'
-                '    }\n'
-                '  },\n'
-                '  "overall_completion": 0-100,\n'
-                '  "research_complete": false,\n'
-                '  "recommended_focus": ["focus1", "focus2"]\n'
-                "}"
-            )
-            coverage = await self._get_llm_response(session, prompt)
-            if not coverage:
-                coverage = self._generate_fallback_coverage()
-            self.research_state["coverage_analysis"] = coverage
-            return coverage
-        except Exception as e:
-            error_msg = f"Error in assess_coverage: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            return self._generate_fallback_coverage()
-
-    def _generate_fallback_coverage(self):
-        try:
-            return {
-                "coverage_by_aspect": {
-                    aspect: {
-                        "coverage_percentage": self.research_state["aspect_coverage"].get(aspect, 0),
-                        "evidence_quality": 0,
-                        "missing_elements": list(details.get("key_concepts", [])),
-                        "contradictions": [],
-                        "confidence_level": 0
-                    } for aspect, details in self.research_state["research_aspects"].get("aspects", {}).items()
-                },
-                "overall_completion": min(
-                    sum(self.research_state["aspect_coverage"].values()) / 
-                    len(self.research_state["aspect_coverage"]) if self.research_state["aspect_coverage"] else 0,
-                    100
-                ),
-                "research_complete": False,
-                "recommended_focus": list(self.research_state["research_aspects"].get("aspects", {}).keys())
-            }
-        except Exception as e:
-            error_msg = f"Error generating fallback coverage: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            return {
-                "coverage_by_aspect": {},
-                "overall_completion": 0,
-                "research_complete": False,
-                "recommended_focus": []
-            }
-
-    async def evaluate_content(self, session, content, url):
+    async def generate_search_query(self, session: aiohttp.ClientSession, aspect: str, findings: List[str]) -> Optional[str]:
+        """
+        Generate focused search queries using LLM. Allows one complex operator and handles query validation.
+        Returns a query string optimized for academic search.
+        """
         prompt = (
-            f"Evaluate this content for all research aspects:\n\n"
-            f"Content: {content[:3000]}\n\n"
-            f"Source: {url}\n\n"
-            f"Research Aspects: {json.dumps(self.research_state['research_aspects'], indent=2)}\n\n"
-            "Provide a detailed evaluation JSON:\n"
-            "{\n"
-            '  "relevance_by_aspect": {\n'
-            '    "aspect_name": {\n'
-            '      "score": 0-10,\n'
-            '      "key_findings": ["finding1", "finding2"],\n'
-            '      "evidence_quality": 1-10,\n'
-            '      "contribution_to_coverage": 0-100\n'
-            '    }\n'
-            '  },\n'
-            '  "source_credibility": 1-10,\n'
-            '  "new_gaps_identified": ["gap1", "gap2"],\n'
-            '  "citation": "formatted citation",\n'
-            '  "methodology": "description of study methodology",\n'
-            '  "limitations": ["limitation1", "limitation2"],\n'
-            '  "contradictory_evidence": false,\n'
-            '  "null_result": false,\n'
-            '  "study_type": "primary research/meta-analysis/review/etc",\n'
-            '  "publication_info": {\n'
-            '    "year": "YYYY",\n'
-            '    "journal": "journal name",\n'
-            '    "peer_reviewed": true/false\n'
-            '  }\n'
-            "}"
+            f"Create ONE search query for research on:\n"
+            f"Topic: {aspect}\n"
+            f"Research Area: {json.dumps(self.state['aspects'].get(aspect, {}))}\n\n"
+            "Requirements:\n"
+            "1. Use 2-4 key concepts\n"
+            "2. You may use ONE Boolean operator (AND, OR) if needed\n"
+            "3. Include essential synonyms in parentheses if needed\n"
+            "4. Focus on academic/scientific sources\n\n"
+            "Return ONLY the search query string without quotes or explanations."
         )
         try:
-            evaluation = await self._get_llm_response(session, prompt)
-            if evaluation:
-                for aspect, details in evaluation["relevance_by_aspect"].items():
-                    if details["score"] >= 6:
-                        self.research_state["findings_by_aspect"][aspect].extend(details["key_findings"])
-                        self._update_aspect_coverage(aspect, details["contribution_to_coverage"])
-                self.research_state["source_credibility_scores"][url] = evaluation["source_credibility"]
-                paper_info = {
-                    "url": url,
-                    "relevance_scores": {k: v["score"] for k, v in evaluation["relevance_by_aspect"].items()},
-                    "citation": evaluation["citation"],
-                    "methodology": evaluation.get("methodology", "Not specified"),
-                    "study_type": evaluation.get("study_type", "Not specified"),
-                    "publication_info": evaluation.get("publication_info", {}),
-                    "contradictory_evidence": evaluation.get("contradictory_evidence", False),
-                    "null_result": evaluation.get("null_result", False)
-                }
-                self.research_state["papers_found"].append(paper_info)
-                if paper_info["citation"]:
-                    self.research_state["citations"].add(paper_info["citation"])
-                self.research_state["gaps_identified"].update(evaluation["new_gaps_identified"])
-                self._track_significant_study(evaluation, url)
-                # Save query mapping if available (assume the last attempted query is stored in a temporary field)
-                if hasattr(self, "_last_query_info"):
-                    q_info = self._last_query_info
-                    self.research_state["query_results"].setdefault(q_info["query"], []).append({
-                        "aspect": q_info["aspect"],
-                        "evaluation": evaluation
-                    })
-                return evaluation
+            query = await self._call_llm(session, prompt)
+            if query:
+                query = query.strip().strip('"\'')
+                words = query.split()
+                # Allow 2-10 words to accommodate Boolean operators
+                if 2 <= len(words) <= 10 and len(query) >= 3:
+                    # Check if query has at most one Boolean operator
+                    upper_query = query.upper()
+                    boolean_count = upper_query.count(" AND ") + upper_query.count(" OR ")
+                    if boolean_count <= 1:
+                        print(f"🔍 Generated query: {query}")
+                        self.state['progress']['queries_attempted'].add(query)
+                        return query
+                    else:
+                        print(f"⚠️ Too many Boolean operators ({boolean_count})")
+                else:
+                    print(f"⚠️ Query length outside bounds ({len(words)} words)")
+                
+                # Retry with simpler prompt if needed
+                retry_prompt = (
+                    f"Generate ONE simple search query for: {aspect}\n"
+                    "Use 2-4 key terms and at most one Boolean operator (AND/OR).\n"
+                    "Return only the search terms."
+                )
+                retry_query = await self._call_llm(session, retry_prompt)
+                if retry_query:
+                    retry_query = retry_query.strip().strip('"\'')
+                    if 2 <= len(retry_query.split()) <= 10:
+                        return retry_query
         except Exception as e:
-            error_msg = f"Error evaluating content from {url}: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
+            self.state["errors"].append(f"Query generation failed: {str(e)}")
+            print(f"❌ Query error: {str(e)}")
+        return None
+    
+    async def process_research_results(self, session: aiohttp.ClientSession, urls: List[str], aspect: str) -> List[Dict]:
+        """
+        Process research results with improved methodology. Focuses on extracting key findings
+        while maintaining relevancy tracking for further analysis.
+        """
+        # Limit to 5 results per research area
+        urls = urls[:5]
+        results = []
+        
+        for url in urls:
+            if url in self.state["processed_urls"]:
+                continue
+                
+            try:
+                content = await self.fetch_content(session, url)
+                if not content:
+                    continue
+                    
+                analysis_prompt = (
+                    f"Analyze this content for {aspect}:\n"
+                    f"{content[:3000]}\n\n"
+                    "Provide JSON with:\n"
+                    "1. relevance_score (0-10)\n"
+                    "2. key_findings (array of relevant findings)\n"
+                    "3. citation_info (title, authors, year, journal)\n"
+                    "Only include findings directly relevant to our research aspect."
+                )
+                
+                analysis = await self._call_llm(session, analysis_prompt)
+                if analysis:
+                    try:
+                        data = json.loads(analysis)
+                        result = {
+                            "url": url,
+                            "relevance_score": data.get("relevance_score", 0),
+                            "key_findings": data.get("key_findings", []),
+                            "citation_info": data.get("citation_info", {})
+                        }
+                        
+                        # Track citation for later use
+                        if result["citation_info"]:
+                            self._track_citation(result["citation_info"])
+                        
+                        # Store findings if relevance score is above threshold
+                        if result["relevance_score"] >= 6:
+                            self.state["findings"].setdefault(aspect, []).extend(result["key_findings"])
+                            
+                        results.append(result)
+                        self.state["processed_urls"].add(url)
+                        
+                        # Log progress
+                        print(f"\n📄 Processed: {url}")
+                        print(f"Relevance: {result['relevance_score']}/10")
+                        if result["key_findings"]:
+                            print("Key Findings:")
+                            for finding in result["key_findings"][:2]:  # Show first 2 findings
+                                print(f"- {finding}")
+                            if len(result["key_findings"]) > 2:
+                                print(f"... and {len(result['key_findings'])-2} more findings")
+                                
+                    except json.JSONDecodeError:
+                        print(f"⚠️ Failed to parse analysis for {url}")
+                        
+            except Exception as e:
+                print(f"❌ Processing error for {url}: {str(e)}")
+                self.state["errors"].append(f"Result processing failed: {str(e)}")
+                
+        # Sort by relevance and return top results
+        return sorted(results, key=lambda x: x["relevance_score"], reverse=True)
+
+    async def perform_deep_analysis(self, session: aiohttp.ClientSession, aspect: str, top_results: List[Dict], max_results: int = 3) -> List[Dict]:
+        """
+        Perform deeper analysis on the most relevant results for each research aspect.
+        """
+        top_results = top_results[:max_results]  # Limit to top 3 most relevant
+        detailed_findings = []
+        
+        for result in top_results:
+            try:
+                content = await self.fetch_content(session, result["url"])
+                if not content:
+                    continue
+                    
+                detailed_prompt = (
+                    f"Perform detailed analysis for {aspect}:\n"
+                    f"{content[:4000]}\n\n"
+                    "Provide JSON with:\n"
+                    "1. comprehensive_findings (detailed findings with evidence)\n"
+                    "2. methodology_quality (0-10)\n"
+                    "3. evidence_strength (0-10)\n"
+                    "4. limitations\n"
+                    "5. implications\n"
+                    "Focus on evidence quality and research implications."
+                )
+                
+                analysis = await self._call_llm(session, detailed_prompt)
+                if analysis:
+                    data = json.loads(analysis)
+                    detailed_findings.append({
+                        "url": result["url"],
+                        "citation_info": result["citation_info"],
+                        "analysis": data
+                    })
+                    
+                    print(f"\n🔍 Deep analysis completed for: {result['url']}")
+                    print(f"Quality: {data.get('methodology_quality', 0)}/10")
+                    print(f"Evidence Strength: {data.get('evidence_strength', 0)}/10")
+                    
+            except Exception as e:
+                print(f"❌ Deep analysis failed for {result['url']}: {str(e)}")
+                
+        return detailed_findings
+
+    async def search_sources(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+        """Search for potential sources using the SERP API with enhanced error handling."""
+        print(f"\n🔎 Executing search query: {query}")
+        try:
+            params = {
+                "q": query,
+                "api_key": SERPAPI_API_KEY,
+                "engine": "google_scholar",
+                "num": 20
+            }
+            async with session.get("https://serpapi.com/search", params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "organic_results" in data:
+                        urls = []
+                        titles = []
+                        for result in data["organic_results"]:
+                            if not isinstance(result, dict):
+                                continue
+                            url = result.get('link')
+                            title = result.get('title', 'No title')
+                            if url:  # Only add if URL exists
+                                urls.append(url)
+                                titles.append(title)
+                        
+                        if urls:
+                            print(f"✅ Found {len(urls)} potential sources:")
+                            for i, (url, title) in enumerate(zip(urls, titles), 1):
+                                print(f"{i}. {title}\n   {url}")
+                            return urls
+                        else:
+                            print("⚠️ No valid URLs found in results")
+                    else:
+                        print("⚠️ No organic_results found in SERP API response")
+                        if "error" in data:
+                            print(f"API Error: {data['error']}")
+                else:
+                    error_text = await resp.text()
+                    print(f"❌ SERP API failed with status: {resp.status}")
+                    print(f"Error details: {error_text}")
+        except Exception as e:
+            error_msg = f"Search failed: {str(e)}"
+            self.state["errors"].append(error_msg)
+            print(f"❌ Search error: {error_msg}")
+        return []
+
+    async def prioritize_sources(self, session: aiohttp.ClientSession, urls: List[str], aspect: str) -> List[Dict]:
+        """Prioritize sources using comprehensive LLM evaluation with robust priority parsing."""
+        prioritized = []
+        aspect_details = self.state['aspects'].get(aspect, {})
+        
+        for url in urls:
+            if url in self.state["processed_urls"]:
+                continue
+            try:
+                preview = await self._get_source_preview(session, url)
+                prompt = (
+                    f"Research Aspect: {aspect}\n"
+                    f"Required Evidence Types: {aspect_details.get('evidence_types', [])}\n"
+                    f"Quality Criteria: {aspect_details.get('criteria', [])}\n\n"
+                    f"Source URL: {url}\n"
+                    f"Preview: {preview}\n\n"
+                    "Rate source priority (1-10) based on:\n"
+                    "1. Relevance to research aspect\n"
+                    "2. Match with required evidence types\n"
+                    "3. Potential to meet quality criteria\n"
+                    "4. Scientific credibility indicators\n"
+                    "5. Data/methodology rigor signals\n\n"
+                    "Respond with: [priority number] | [one-sentence reasoning]"
+                )
+                
+                response = await self._call_llm(session, prompt)
+                if response:
+                    try:
+                        # First try to find a number at the start of the response
+                        import re
+                        number_match = re.search(r'^[^\d]*(\d+(?:\.\d+)?)', response)
+                        if not number_match:
+                            # If no number at start, look for any number
+                            number_match = re.search(r'(\d+(?:\.\d+)?)', response)
+                        
+                        if number_match:
+                            try:
+                                priority = float(number_match.group(1))
+                                priority = int(max(1, min(10, priority)))
+                                # Get everything after the number as reasoning
+                                reasoning = response[number_match.end():].strip()
+                                if '|' in reasoning:  # If there's a pipe, take everything after it
+                                    reasoning = reasoning.split('|', 1)[1].strip()
+                                
+                                prioritized.append({
+                                    "url": url,
+                                    "priority": priority,
+                                    "reasoning": reasoning or "No explicit reasoning provided",
+                                    "evidence_types": [et for et in aspect_details.get('evidence_types', []) 
+                                                    if et.lower() in preview.lower()],
+                                    "criteria_matched": [c for c in aspect_details.get('criteria', []) 
+                                                    if c.lower() in preview.lower()]
+                                })
+                                
+                                if priority >= 7:
+                                    print(f"🌟 High Priority ({priority}/10): {url}")
+                                    print(f"📋 Reason: {reasoning}")
+                                elif priority <= 3:
+                                    print(f"⚠️ Low Priority ({priority}/10): {url}")
+                            except ValueError:
+                                print(f"⚠️ Could not convert priority to number: {number_match.group(1)}")
+                                self.state["errors"].append(f"Priority conversion failed for {url}")
+                        else:
+                            print(f"⚠️ No priority number found in response: {response[:100]}...")
+                            self.state["errors"].append(f"No priority number found for {url}")
+                    except Exception as e:
+                        print(f"⚠️ Priority parsing error: {str(e)}")
+                        self.state["errors"].append(f"Priority parsing failed for {url}: {str(e)}")
+                        
+            except Exception as e:
+                self.state["errors"].append(f"Source prioritization failed for {url}: {str(e)}")
+                continue
+                
+        return sorted(prioritized,
+                    key=lambda x: (x['priority'], len(x['evidence_types']), len(x['criteria_matched'])),
+                    reverse=True)
+
+    async def _get_source_preview(self, session: aiohttp.ClientSession, url: str) -> str:
+        """Get a preview of source content using fetch_preview."""
+        try:
+            preview = await self.fetch_preview(session, url)
+            return preview if preview else ""
+        except Exception as e:
+            print(f"⚠️ Preview fetch failed: {str(e)}")
+            return ""
+
+    async def analyze_failure(self, session: aiohttp.ClientSession, query_info: Dict, error: str) -> Dict:
+        """Use LLM to analyze and recover from research failures."""
+        prompt = (
+            f"Analyze this research failure:\n"
+            f"Query: {query_info['query']}\n"
+            f"Error: {error}\n"
+            f"Aspect: {query_info['aspect']}\n"
+            f"Research Goal: {self.state['request']}\n\n"
+            "Provide a JSON response with:\n"
+            "1. analysis: What went wrong\n"
+            "2. alternative_queries: Array of 3 alternative search queries\n"
+            "3. different_approaches: Array of other research strategies\n"
+            "4. recovery_plan: Step-by-step recovery strategy"
+        )
+        try:
+            response = await self._call_llm(session, prompt)
+            if response:
+                return json.loads(response)
+        except Exception as e:
+            self.state["errors"].append(f"Failure analysis failed: {str(e)}")
+        return {
+            "analysis": "Analysis failed",
+            "alternative_queries": [],
+            "different_approaches": [],
+            "recovery_plan": ["Retry with modified query"]
+        }
+
+    async def handle_failed_query(self, session: aiohttp.ClientSession, query_info: Dict, error_msg: str) -> None:
+        """Handle failed search queries with analysis and recovery."""
+        try:
+            failure_analysis = await self.analyze_failure(session, query_info, error_msg)
+            self.state['progress']['failed_queries'].append({
+                "query": query_info['query'],
+                "aspect": query_info['aspect'],
+                "error": error_msg,
+                "analysis": failure_analysis
+            })
+            print(f"\n⚠️ Search failed for query: {query_info['query']}")
+            if failure_analysis.get('analysis'):
+                print(f"Analysis: {failure_analysis['analysis']}")
+            if failure_analysis.get('alternative_queries'):
+                print("Suggested alternatives:", failure_analysis['alternative_queries'])
+        except Exception as e:
+            self.state["errors"].append(f"Failed to handle failed query: {str(e)}")
+            print(f"❌ Error handling failed query: {str(e)}")
+
+    async def _analyze_content(self, session: aiohttp.ClientSession, content: str, aspect: str) -> Dict:
+        """Perform a single LLM call that both evaluates relevance and extracts full research analysis."""
+        prompt = (
+            f"Analyze this content thoroughly:\n"
+            f"Research Aspect: {aspect}\n"
+            f"Content: {content[:3000]}\n\n"
+            "Extract the following:\n"
+            "1. Relevance score (0-10) for this content regarding the research aspect\n"
+            "2. Key findings relevant to the research (each with: finding, confidence (0-10), evidence_strength (0-10), novelty (0-10))\n"
+            "3. Quality assessment: {{ methodology: 0-10, evidence: 0-10, novelty: 0-10, rigor: 0-10 }}\n"
+            "4. Citation info: {{ title, authors, year, journal, doi }}\n\n"
+            "Return JSON with the fields: relevance_score, key_findings, quality_assessment, citation_info."
+        )
+        try:
+            analysis = await self._call_llm(session, prompt)
+            return json.loads(analysis) if analysis else {}
+        except Exception as e:
+            print(f"❌ Analysis error: {str(e)}")
+            return {}
+
+    async def fetch_content(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        """Fetch content with enhanced error handling and retry logic."""
+        max_retries = 3
+        backoff_delay = 1
+        for attempt in range(max_retries):
+            print(f"\n🔍 Attempting to fetch: {url} (Attempt {attempt + 1}/{max_retries})")
+            print("📡 Attempting direct access...")
+            try:
+                async with session.get(url, timeout=30) as resp:
+                    if resp.status == 200:
+                        content = await resp.text(errors='ignore')
+                        if content:
+                            print("✅ Direct access successful")
+                            cleaned_content = self._clean_content(content)
+                            if cleaned_content:
+                                return cleaned_content
+                            print("⚠️ Content cleaning failed, retrying...")
+                        else:
+                            print("⚠️ Empty content received")
+                    else:
+                        print(f"⚠️ Direct access failed with status: {resp.status}")
+                        if resp.status in [403, 404, 410]:
+                            break
+                if attempt < max_retries - 1:
+                    delay = backoff_delay * (2 ** attempt)
+                    print(f"⏳ Waiting {delay} seconds before retry...")
+                    await asyncio.sleep(delay)
+            except asyncio.TimeoutError:
+                print("⚠️ Request timed out")
+                self.state["errors"].append(f"Direct access timeout: {url}")
+            except Exception as e:
+                print(f"❌ Direct access error: {str(e)}")
+                self.state["errors"].append(f"Direct access failed: {str(e)}")
+                if isinstance(e, (aiohttp.ClientPayloadError, aiohttp.ClientOSError)):
+                    break
+        print("🔄 Attempting JINA API access...")
+        try:
+            jina_url = f"{JINA_BASE_URL}{url}"
+            headers = {"Authorization": f"Bearer {JINA_API_KEY}"}
+            async with session.get(jina_url, headers=headers, timeout=30) as resp:
+                if resp.status == 200:
+                    content = await resp.text(errors='ignore')
+                    if content:
+                        print("✅ JINA API access successful")
+                        cleaned_content = self._clean_content(content)
+                        if cleaned_content:
+                            return cleaned_content
+                        print("⚠️ JINA content cleaning failed")
+                    else:
+                        print("⚠️ Empty content from JINA API")
+                else:
+                    print(f"❌ JINA API failed with status: {resp.status}")
+        except asyncio.TimeoutError:
+            print("⚠️ JINA API request timed out")
+            self.state["errors"].append(f"JINA API timeout: {url}")
+        except Exception as e:
+            print(f"❌ JINA API error: {str(e)}")
+            self.state["errors"].append(f"JINA access failed: {str(e)}")
+        print("❌ Failed to fetch content via both direct access and JINA API")
+        return None
+
+    def _clean_content(self, text: str) -> Optional[str]:
+        """
+        Clean content with enhanced HTML handling and better text normalization.
+        Removes scripts, styles, and other non-content elements.
+        """
+        if not text:
+            return None
+        
+        try:
+            # First remove common HTML elements that don't contain useful content
+            html_patterns = [
+                r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>',  # Remove scripts
+                r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>',     # Remove styles
+                r'<nav\b[^>]*>.*?<\/nav>',                             # Remove navigation
+                r'<header\b[^>]*>.*?<\/header>',                       # Remove headers
+                r'<footer\b[^>]*>.*?<\/footer>',                       # Remove footers
+                r'<!--.*?-->',                                         # Remove comments
+                r'<!\[CDATA\[.*?\]\]>',                               # Remove CDATA
+                r'<select\b[^>]*>.*?<\/select>'                       # Remove select elements
+            ]
+            
+            cleaned = text
+            for pattern in html_patterns:
+                cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL | re.IGNORECASE)
+            
+            # Remove remaining HTML tags while preserving their content
+            cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+            
+            # Clean special characters and normalize whitespace
+            cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\xFF]', '', cleaned)
+            cleaned = re.sub(r'&[a-zA-Z]+;', ' ', cleaned)  # Remove HTML entities
+            cleaned = re.sub(r'\s+', ' ', cleaned)
+            
+            # Remove common noise
+            noise_patterns = [
+                r'\[PDF\]|\[HTML\]|\[CITATION\]',
+                r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                r'[""'']',
+                r'[–—]',
+                r'cookie[s]?\s+policy',
+                r'privacy\s+policy',
+                r'terms\s+of\s+service',
+                r'javascript\s+must\s+be\s+enabled'
+            ]
+            
+            for pattern in noise_patterns:
+                cleaned = re.sub(pattern, ' ', cleaned, flags=re.IGNORECASE)
+            
+            # Normalize quotes and dashes
+            cleaned = re.sub(r'[""'']', '"', cleaned)
+            cleaned = re.sub(r'[–—]', '-', cleaned)
+            
+            # Final cleanup
+            cleaned = cleaned.strip()
+            
+            # Verify minimum content length and meaningful content
+            if len(cleaned) < 50 or not re.search(r'[a-zA-Z]{3,}', cleaned):
+                print("⚠️ Cleaned content too short or lacks meaningful text")
+                return None
+                
+            return cleaned
+            
+        except Exception as e:
+            print(f"❌ Content cleaning error: {str(e)}")
+            self.state["errors"].append(f"Content cleaning failed: {str(e)}")
             return None
 
-    def _update_aspect_coverage(self, aspect, contribution):
-        try:
-            current_coverage = self.research_state["aspect_coverage"][aspect]
-            new_coverage = min(100, current_coverage + (contribution * 0.1))
-            self.research_state["aspect_coverage"][aspect] = new_coverage
-        except Exception as e:
-            error_msg = f"Error updating coverage for aspect {aspect}: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
+    def _track_citation(self, citation_info: Dict) -> None:
+        """Track citation with proper formatting."""
+        if not citation_info:
+            return
+        authors = citation_info.get('authors')
+        if not authors or len(authors) == 0:
+            authors = ['Unknown']
+        formatted_authors = authors[0] + " et al." if len(authors) > 1 else authors[0]
+        citation = " ".join(filter(None, [
+            formatted_authors,
+            f"({citation_info.get('year', 'n.d.')})",
+            citation_info.get('title', ''),
+            citation_info.get('journal', ''),
+            citation_info.get('doi', '')
+        ]))
+        self.state["citations"].add(citation)
 
-    async def generate_final_report(self, session):
-        """Generate comprehensive final report with intelligent chunking and summary prioritization."""
-        try:
-            # First generate executive summary of key findings
-            executive_summary = await self._generate_executive_summary(session)
-            
-            # Generate aspect-specific reports with prioritized findings
-            aspect_reports = []
-            for aspect, coverage in self.research_state["aspect_coverage"].items():
-                if coverage > 0:  # Only include aspects with findings
-                    aspect_report = await self._generate_aspect_report(session, aspect)
-                    aspect_reports.append(aspect_report)
-
-            # Compile final report with intelligent length management
-            report_sections = [
-                "# Research Report\n\n",
-                "## Executive Summary\n\n",
-                f"{executive_summary}\n\n",
-                "## Methodology\n\n",
-                await self._generate_methodology_section(session),
-                "\n## Key Findings by Research Aspect\n\n"
-            ]
-
-            # Add prioritized aspect reports
-            for aspect_report in aspect_reports:
-                report_sections.append(aspect_report)
-
-            # Add analysis sections with length management
-            report_sections.extend([
-                "\n## Evidence Quality Analysis\n\n",
-                await self._generate_evidence_analysis(session),
-                "\n## Critical Gaps and Limitations\n\n",
-                await self._generate_gaps_analysis(session),
-                "\n## High-Impact Studies\n\n",
-                await self._generate_significant_studies_summary(session)
-            ])
-
-            # Combine sections with intelligent truncation
-            return self._combine_report_sections(report_sections)
-
-        except Exception as e:
-            error_msg = f"Error generating final report: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            print(error_msg)
-            return await self._generate_emergency_report(session)
-
-    async def _generate_executive_summary(self, session):
-        """Generate concise executive summary focusing on key findings."""
-        try:
-            # Prioritize findings by evidence quality and coverage
-            key_findings = []
-            for aspect, data in self.research_state["findings_by_aspect"].items():
-                quality = self.research_state["coverage_analysis"].get("coverage_by_aspect", {}).get(aspect, {}).get("evidence_quality", 0)
-                findings = sorted(data, key=lambda x: x.get("significance", 0), reverse=True)[:3]
-                key_findings.extend([(aspect, finding, quality) for finding in findings])
-
-            # Sort by evidence quality
-            key_findings.sort(key=lambda x: x[2], reverse=True)
-
-            # Generate summary
-            summary = f"Analysis of {len(self.research_state['papers_found'])} studies across {len(self.research_state['research_aspects'])} aspects reveals:\n\n"
-            for aspect, finding, quality in key_findings[:10]:  # Top 10 findings
-                summary += f"- {finding} ({aspect}, Evidence Quality: {quality}/10)\n"
-
-            return summary
-
-        except Exception as e:
-            return f"Error generating executive summary: {str(e)}"
-
-    def _combine_report_sections(self, sections):
-        """Combine report sections with intelligent length management."""
-        total_length = sum(len(s) for s in sections)
-        if total_length <= 5000:
-            return "".join(sections)
-
-        # If too long, prioritize sections
-        essential_sections = sections[:7]  # Executive summary and methodology
-        remaining_space = 5000 - sum(len(s) for s in essential_sections)
-        
-        # Distribute remaining space across other sections
-        other_sections = sections[7:]
-        if remaining_space > 0 and other_sections:
-            space_per_section = remaining_space // len(other_sections)
-            truncated_sections = [
-                section[:space_per_section] + "\n[Section truncated for length]\n"
-                for section in other_sections
-            ]
-            return "".join(essential_sections + truncated_sections)
-        
-        return "".join(essential_sections) + "\n[Report truncated for length]\n"
-
-    def _format_report_as_markdown(self, report):
-        try:
-            markdown = [
-                "# Research Report\n\n",
-                "## Executive Summary\n\n",
-                f"{report.get('executive_summary', 'No executive summary available.')}\n\n",
-                "## Methodology\n\n",
-                f"{report.get('methodology', 'No methodology available.')}\n\n",
-                "## Findings by Research Aspect\n\n"
-            ]
-            for aspect, details in report.get('findings_by_aspect', {}).items():
-                markdown.extend([
-                    f"### {aspect}\n\n",
-                    "#### Key Findings\n\n"
-                ])
-                for finding in details.get('key_findings', []):
-                    markdown.append(f"- {finding}\n")
-                markdown.extend([
-                    f"\n#### Evidence Quality\n\n{details.get('evidence_quality', 'Not available.')}\n\n",
-                    "#### Significant Studies\n\n"
-                ])
-                for study in details.get('significant_studies', []):
-                    markdown.append(f"- {study}\n")
-                markdown.append("\n")
-            markdown.extend([
-                "## Evidence Quality Analysis\n\n",
-                f"{report.get('evidence_quality_analysis', 'No analysis available.')}\n\n",
-                "## Coverage Analysis\n\n",
-                f"{report.get('coverage_analysis', 'No analysis available.')}\n\n",
-                "## Contradictory Evidence\n\n"
-            ])
-            for evidence in report.get('contradictory_evidence', []):
-                markdown.append(f"- {evidence}\n")
-            markdown.extend(["\n## Null Results\n\n"])
-            for result in report.get('null_results', []):
-                markdown.append(f"- {result}\n")
-            markdown.extend(["\n## Gaps and Limitations\n\n"])
-            for gap in report.get('gaps_and_limitations', []):
-                markdown.append(f"- {gap}\n")
-            markdown.extend(["\n## Recommendations\n\n"])
-            for rec in report.get('recommendations', []):
-                markdown.append(f"- {rec}\n")
-            markdown.extend(["\n## References\n\n"])
-            for ref in report.get('references', []):
-                markdown.append(f"{ref}\n")
-            markdown.extend(["\n## Query Results\n\n"])
-            for query, evaluations in report.get('query_results', {}).items():
-                markdown.append(f"**Query:** {query}\n")
-                for eval_item in evaluations:
-                    markdown.append(f"- Aspect: {eval_item.get('aspect')}, Summary: {json.dumps(eval_item.get('evaluation'), indent=2)}\n")
-                markdown.append("\n")
-            return "".join(markdown)
-        except Exception as e:
-            error_msg = f"Error formatting report as markdown: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            return "Error generating formatted report."
-
-    async def ensure_final_report(self, session):
-        try:
-            for aspect in self.research_state["research_aspects"]["aspects"]:
-                if aspect not in self.research_state["completed_aspects"]:
-                    await self.generate_aspect_report(session, aspect)
-            # Print significant studies only once at the end.
-            self._display_significant_studies()
-            report = await self.generate_final_report(session)
-            if report:
-                print("\n🧠 FINAL REPORT:")
-                print(report)
-            else:
-                print("\n⚠️ Failed to generate detailed final report. Generating emergency summary...")
-                emergency_summary = (
-                    "EMERGENCY RESEARCH SUMMARY\n\n"
-                    f"Original Request: {self.research_state['original_request']}\n\n"
-                    "Research Progress:\n"
-                )
-                for aspect, coverage in self.research_state["aspect_coverage"].items():
-                    emergency_summary += f"\n{aspect}: {coverage}% complete"
-                emergency_summary += "\n\nSignificant Findings:\n"
-                for aspect, findings in self.research_state["findings_by_aspect"].items():
-                    if findings:
-                        emergency_summary += f"\n{aspect}:\n"
-                        for finding in findings:
-                            emergency_summary += f"- {finding}\n"
-                print(emergency_summary)
-            return report or emergency_summary
-        except Exception as e:
-            error_msg = f"Error ensuring final report: {str(e)}"
-            self.research_state["error_log"].append(error_msg)
-            return "Failed to generate any report due to critical errors."
-
-    def _display_significant_studies(self):
-        print("\n📚 Significant Studies Found:")
-        categories = {
-            "High Relevance Studies": "high_relevance",
-            "Medium Relevance Studies": "medium_relevance",
-            "Contradictory Evidence": "contradictory",
-            "Null Results": "null_results"
+    async def fetch_preview(self, session: aiohttp.ClientSession, url: str, max_retries: int = 3) -> Optional[str]:
+        """
+        Fetch a preview of the content with enhanced error handling and retry logic.
+        Handles various HTTP status codes and implements exponential backoff.
+        """
+        headers = {
+            "Range": "bytes=0-2000",
+            "User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0; +http://example.com/bot)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        for category_name, category_key in categories.items():
-            studies = self.research_state["significant_studies"][category_key]
-            if studies:
-                print(f"\n{category_name}:")
-                for i, study in enumerate(studies, 1):
-                    print(f"\n{i}. {study['citation']}")
-                    print(f"   URL: {study['url']}")
-                    print(f"   Evidence Quality: {study['evidence_quality']}/10")
-                    if study['key_findings']:
-                        print("   Key Findings:")
-                        for finding in study['key_findings']:
-                            print(f"   - {finding}")
-                    if study['limitations']:
-                        print("   Limitations:")
-                        for limitation in study['limitations']:
-                            print(f"   - {limitation}")
-                    print()
+        
+        for attempt in range(max_retries):
+            try:
+                async with session.get(url, headers=headers, timeout=10) as resp:
+                    if resp.status in (200, 206):
+                        content = await resp.text(errors='ignore')
+                        preview = self._clean_content(content)
+                        if preview:
+                            print(f"Preview for {url} (first 100 chars): {preview[:100]}...")
+                            return preview
+                        print(f"⚠️ No usable content found in preview for {url}")
+                    elif resp.status == 403:
+                        print(f"⚠️ Access forbidden for {url}")
+                        # Try alternative preview method using JINA
+                        try:
+                            jina_url = f"{JINA_BASE_URL}{url}"
+                            jina_headers = {"Authorization": f"Bearer {JINA_API_KEY}"}
+                            async with session.get(jina_url, headers=jina_headers, timeout=10) as jina_resp:
+                                if jina_resp.status == 200:
+                                    content = await jina_resp.text(errors='ignore')
+                                    preview = self._clean_content(content)
+                                    if preview:
+                                        print(f"✅ JINA preview successful for {url}")
+                                        return preview
+                        except Exception as je:
+                            print(f"⚠️ JINA preview failed: {str(je)}")
+                    elif resp.status == 429:  # Rate limit
+                        wait_time = 2 ** attempt
+                        print(f"⚠️ Rate limited, waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"⚠️ Preview fetch failed with status {resp.status} for {url}")
+                
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    
+            except asyncio.TimeoutError:
+                print(f"⚠️ Timeout fetching preview for {url}")
+                if attempt < max_retries - 1:
+                    continue
+            except Exception as e:
+                error_msg = f"Preview fetch failed for {url}: {str(e)}"
+                self.state["errors"].append(error_msg)
+                print(f"⚠️ {error_msg}")
+                if attempt < max_retries - 1:
+                    continue
+                else:
+                    break
+        
+        return None
 
-    async def check_aspect_completion(self, session, aspect):
-        current = self.research_state["aspect_coverage"].get(aspect, 0)
-        if current >= 90:
-            self.research_state["completed_aspects"].add(aspect)
-            print(f"Aspect '{aspect}' marked as completed (coverage: {current}%).")
-        else:
-            print(f"Aspect '{aspect}' not yet complete (coverage: {current}%).")
+    async def research_aspect(self, session: aiohttp.ClientSession, aspect: str, iteration: int) -> bool:
+        """
+        Perform one iteration of researching a given aspect using improved methodology.
+        Maintains asynchronous processing with semaphore control.
+        """
+        print(f"\n📊 Research Progress for {aspect}")
+        print(f"Current Coverage: {self.state['coverage'].get(aspect, 0)}%")
+        print(f"Successful Findings: {len(self.state['findings'].get(aspect, []))}")
+        print(f"Failed Attempts: {len([q for q in self.state['progress']['failed_queries'] if q['aspect'] == aspect])}")
 
-    async def generate_aspect_report(self, session, aspect):
-        report = f"Report for aspect '{aspect}':\n"
-        findings = self.research_state["findings_by_aspect"].get(aspect, [])
-        if findings:
-            report += "\n".join(f"- {finding}" for finding in findings)
-        else:
-            report += "No significant findings available."
-        self.research_state["aspect_reports"][aspect] = report
-        self.research_state["completed_aspects"].add(aspect)
-        print(f"Generated report for aspect '{aspect}'.")
+        try:
+            # Generate and execute search query
+            query = await self.generate_search_query(session, aspect, self.state['findings'].get(aspect, []))
+            if not query:
+                return False
 
-    async def process_query_safely(self, session, query_info):
-        query = query_info.get("query")
-        aspect = query_info.get("aspect")
-        print(f"Processing query for aspect '{aspect}': {query}")
-        self._last_query_info = query_info  # Save query info for mapping
-        urls = await self.perform_search(session, query)
-        success = False
-        if urls:
+            self.state['progress']['queries_attempted'].add(query)
+            print(f"\n📚 Researching {aspect} (Iteration {iteration})")
+            print(f"🔍 Query: {query}")
+            
+            # Get search results
+            urls = await self.search_sources(session, query)
+            if not urls:
+                await self.handle_failed_query(session, {"query": query, "aspect": aspect}, "No sources found")
+                return False
+
+            # Process results concurrently with semaphore control
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            evaluations = await self.process_urls(session, urls, semaphore)
-            if evaluations:
-                success = True
-        if success:
-            self.research_state["successful_queries"].append(query)
-        else:
-            await self.handle_failed_query(session, query_info)
-        return success
+            async def process_with_semaphore(url):
+                async with semaphore:
+                    return await self.process_research_results(session, [url], aspect)
 
-    async def handle_failed_query(self, session, query_info):
-        error_msg = f"Query failed for aspect '{query_info.get('aspect')}' with query: {query_info.get('query')}"
-        self.research_state["failed_queries"].append(query_info)
-        self.research_state["error_log"].append(error_msg)
-        print(error_msg)
+            tasks = [process_with_semaphore(url) for url in urls[:5]]  # Limit to 5 results
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Filter out exceptions and flatten results
+            valid_results = [
+                result[0] for result in results 
+                if isinstance(result, list) and result and not isinstance(result, Exception)
+            ]
 
-async def conduct_research(goal):
-    assistant = None
-    session = None
-    try:
-        assistant = ResearchAssistant()
-        async with aiohttp.ClientSession() as session:
-            print("🔍 Analyzing research request...")
-            analysis = await assistant.initialize_research(session, goal)
+            if not valid_results:
+                return False
+
+            # Perform deep analysis concurrently on top 3
+            sorted_results = sorted(valid_results, key=lambda x: x.get('relevance_score', 0), reverse=True)
+            top_results = sorted_results[:3]
+
+            async def analyze_with_semaphore(result):
+                async with semaphore:
+                    return await self.perform_deep_analysis(session, aspect, [result])
+
+            analysis_tasks = [analyze_with_semaphore(result) for result in top_results]
+            detailed_findings = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+            
+            # Process successful analyses
+            valid_findings = [
+                finding[0] for finding in detailed_findings 
+                if isinstance(finding, list) and finding and not isinstance(finding, Exception)
+            ]
+
+            if valid_findings:
+                # Calculate quality metrics
+                quality_scores = []
+                for finding in valid_findings:
+                    analysis = finding.get('analysis', {})
+                    quality = (
+                        analysis.get('methodology_quality', 0) +
+                        analysis.get('evidence_strength', 0)
+                    ) / 2
+                    quality_scores.append(quality)
+
+                if quality_scores:
+                    avg_quality = sum(quality_scores) / len(quality_scores)
+                    coverage_increase = min(avg_quality * 10, 25)
+                    current = self.state['coverage'].get(aspect, 0)
+                    self.state['coverage'][aspect] = min(100, current + coverage_increase)
+                    
+                    print(f"\n📈 Updated Coverage: {self.state['coverage'][aspect]}%")
+                    print(f"📊 Average Quality Score: {avg_quality:.1f}/10")
+                    
+                    if query not in self.state['progress']['successful_queries']:
+                        self.state['progress']['successful_queries'].append(query)
+                    
+                    return True
+
+            # Handle unsuccessful research attempt
+            failure_analysis = await self.analyze_failure(
+                session,
+                {"query": query, "aspect": aspect},
+                "No relevant findings extracted"
+            )
+            print("\n⚠️ Research attempt did not yield quality findings")
+            print("Analysis:", failure_analysis.get('analysis', 'No analysis available'))
+            self.state['progress']['failed_queries'].append({
+                "query": query,
+                "aspect": aspect,
+                "analysis": failure_analysis
+            })
+            return False
+            
+        except Exception as e:
+            self.state["errors"].append(f"Research failed for {aspect}: {str(e)}")
+            print(f"❌ Research error: {str(e)}")
+            return False
+        
+    async def process_url(self, session: aiohttp.ClientSession, url: str, aspect: str) -> Optional[Dict]:
+        """Process URL with emphasis on thorough review."""
+        if url in self.state["processed_urls"]:
+            print(f"⏭️ Already processed: {url}")
+            return None
+        print(f"\n📖 Processing: {url}")
+        try:
+            content = await self.fetch_content(session, url)
+            if not content:
+                print("❌ Could not fetch content")
+                return None
+            # In this merged approach, we call _analyze_content directly,
+            # which evaluates relevance and extracts findings.
+            analysis = await self._analyze_content(session, content, aspect)
+            if analysis and 'key_findings' in analysis:
+                self.state['findings'].setdefault(aspect, []).extend(analysis['key_findings'])
+                print(f"✨ Added {len(analysis['key_findings'])} findings")
+            self._track_citation({
+                "url": url,
+                "title": analysis.get('title', ''),
+                "authors": analysis.get('authors', []),
+                "year": analysis.get('year'),
+                "journal": analysis.get('journal')
+            })
+            self.state["processed_urls"].add(url)
+            return analysis
+        except Exception as e:
+            print(f"❌ Processing error: {str(e)}")
+            self.state["errors"].append(f"URL processing failed: {str(e)}")
+        return None
+
+    async def generate_interim_report(self, session: aiohttp.ClientSession, aspect: str) -> str:
+        """Generate detailed interim report for a research aspect."""
+        analysis_prompt = (
+            f"Analyze research progress for aspect: {aspect}\n"
+            f"Findings: {json.dumps(self.state['findings'].get(aspect, []))}\n"
+            f"Coverage: {self.state['coverage'].get(aspect, 0)}%\n"
+            f"Quality Scores: {json.dumps(self.state['research_quality']['aspect_scores'].get(aspect, []))}\n"
+            f"Studies: {json.dumps([s for s in self.state['studies']['high_relevance'] if aspect in s.get('relevance_scores', {})])}\n\n"
+            "Provide detailed JSON analysis with:\n"
+            "1. key_findings_synthesis\n"
+            "2. evidence_quality_assessment\n"
+            "3. remaining_gaps\n"
+            "4. research_recommendations\n"
+            "5. potential_biases"
+        )
+        try:
+            analysis = await self._call_llm(session, analysis_prompt)
             if not analysis:
-                print("❌ Failed to analyze research request")
-                return await assistant.ensure_final_report(session)
+                raise ValueError("Analysis failed")
+            analyzed = json.loads(analysis)
+            report_prompt = (
+                f"Generate interim research report using this analysis:\n"
+                f"{json.dumps(analyzed)}\n\n"
+                "Format as markdown with sections:\n"
+                "1. Current Progress\n"
+                "2. Key Findings\n"
+                "3. Evidence Quality\n"
+                "4. Gaps and Limitations\n"
+                "5. Next Steps\n\n"
+                "Include relevant citations and quality metrics."
+            )
+            report = await self._call_llm(session, report_prompt)
+            if report:
+                return report
+        except Exception as e:
+            self.state["errors"].append(f"Interim report generation failed for {aspect}: {str(e)}")
+        return (
+            f"# Interim Report: {aspect}\n\n"
+            f"## Current Progress\nCoverage: {self.state['coverage'].get(aspect, 0)}%\n\n"
+            f"## Key Findings\n" + "\n".join(f"- {finding}" for finding in self.state['findings'].get(aspect, [])) +
+            "\n\n## Evidence Quality\nBased on {len(self.state['research_quality']['aspect_scores'].get(aspect, []))} evaluated sources\n\n"
+            "## Gaps and Limitations\n- Report generation failed, showing raw findings\n\n"
+            "## Next Steps\n- Continue research to improve coverage\n- Attempt report generation again"
+        )
+
+    async def generate_academic_report(self, session: aiohttp.ClientSession) -> str:
+        """Generate comprehensive executive report with citations in one step."""
+        try:
+            findings = {
+                aspect: [
+                    finding if isinstance(finding, dict) else {"finding": finding, "confidence": "N/A", "evidence_strength": "N/A"}
+                    for finding in findings_list
+                ]
+                for aspect, findings_list in self.state.get('findings', {}).items() if findings_list
+            }
+            citations = list(self.state.get('citations', set()))
+            coverage = {aspect: score for aspect, score in self.state.get('coverage', {}).items() if isinstance(score, (int, float))}
+            quality_metrics = {
+                aspect: scores for aspect, scores in self.state.get('research_quality', {}).get('aspect_scores', {}).items() if scores
+            }
+            if not findings:
+                print("⚠️ No findings available for report generation")
+                return self._format_raw_findings()
+            report_prompt = (
+                f"Generate an executive research report for:\n"
+                f"Research Question: {self.state.get('request', 'Research question not available')}\n"
+                f"Findings: {json.dumps(findings, ensure_ascii=False)}\n"
+                f"Citations: {json.dumps(citations, ensure_ascii=False)}\n"
+                f"Coverage: {json.dumps(coverage, ensure_ascii=False)}\n"
+                f"Quality Metrics: {json.dumps(quality_metrics, ensure_ascii=False)}\n\n"
+                "Create a professional executive report with:\n"
+                "1. Executive Summary (key findings and implications)\n"
+                "2. Research Overview\n"
+                "3. Key Findings by Research Aspect\n"
+                "4. Evidence Quality and Limitations\n"
+                "5. References\n\n"
+                "Requirements:\n"
+                "- Use clear, professional language\n"
+                "- Include relevant citations [Author, Year]\n"
+                "- Highlight strength of evidence\n"
+                "- Address research gaps\n"
+                "Format in markdown with proper styling."
+            )
+            report = await self._call_llm(session, report_prompt)
+            if report and len(report.strip()) > 100:
+                try:
+                    if all(section in report for section in ['# ', '## ', 'Summary', 'Findings']):
+                        return report
+                    else:
+                        print("⚠️ Generated report missing required sections")
+                except Exception as e:
+                    print(f"⚠️ Report validation failed: {str(e)}")
+            print("⚠️ Falling back to raw findings format")
+            return self._format_raw_findings()
+        except Exception as e:
+            self.state["errors"].append(f"Report generation failed: {str(e)}")
+            return self._format_raw_findings()
+
+    def _format_raw_findings(self) -> str:
+        """Format raw findings in a clear, structured way."""
+        sections = [
+            "# Research Findings Summary\n",
+            f"## Research Question\n{self.state['request']}\n",
+            "## Key Findings by Aspect\n"
+        ]
+        for aspect, findings in self.state['findings'].items():
+            if findings:
+                sections.append(f"\n### {aspect} (Coverage: {self.state['coverage'].get(aspect, 0)}%)\n")
+                for finding in findings:
+                    if isinstance(finding, dict):
+                        confidence = finding.get('confidence', 'N/A')
+                        evidence = finding.get('evidence_strength', 'N/A')
+                        sections.append(f"- Finding: {finding.get('finding', 'Unknown')}\n")
+                        sections.append(f"  Confidence: {confidence}/10\n")
+                        sections.append(f"  Evidence Strength: {evidence}/10\n")
+                    else:
+                        sections.append(f"- {finding}\n")
+        if self.state['citations']:
+            sections.extend([
+                "\n## Sources\n",
+                *[f"- {citation}\n" for citation in sorted(self.state['citations'])]
+            ])
+        return "\n".join(sections)
+
+    def display_relevant_studies(self, aspect: str, studies: List[Dict]) -> None:
+        """Display relevant studies for an aspect."""
+        relevant = [study for study in studies if aspect.lower() in study.get('title', '').lower()]
+        if relevant:
+            print(f"\n📚 Relevant Studies for {aspect}:")
+            for study in relevant[:3]:
+                print(f"- {study['title']}")
+                print(f"  Quality: {study['quality_score']:.1f}/10")
+            print(f"  Relevance: {study['relevance_score']:.1f}/10")
+
+    def _safe_json_parse(self, text: str) -> Dict:
+        """Safely parse JSON with error handling."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            self.state["errors"].append(f"JSON parsing failed: {str(e)}")
+            return {}
+
+async def conduct_research(question: str) -> Optional[str]:
+    """
+    Orchestrates research by processing aspects concurrently while maintaining controlled concurrency.
+    """
+    assistant = ResearchAssistant()
+    async with aiohttp.ClientSession() as session:
+        try:
+            print("🔍 Analyzing research request...")
+            init_success = await assistant.initialize_research(session, question)
+            if not init_success:
+                print("❌ Failed to analyze research request. Captured errors:")
+                for err in assistant.state.get("errors", []):
+                    print(f"   - {err}")
+                return None
 
             print("\n📊 Research Plan:")
-            print(json.dumps(analysis, indent=2))
+            print(json.dumps(assistant.state["aspects"], indent=2))
 
-            iteration = 0
-            previous_overall = 0
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            while iteration < 20:
-                iteration += 1
+            # Track the most relevant sources for each aspect
+            top_sources_by_aspect = {aspect: [] for aspect in assistant.state["aspects"].keys()}
+            
+            iteration = 1
+            while iteration <= 10:
                 print(f"\n🔄 Iteration {iteration}")
-                coverage = await assistant.assess_coverage(session)
-                overall = coverage.get('overall_completion', 0)
-                print(f"Overall completion: {overall}%")
-                # Print summary per aspect
-                for aspect, details in coverage.get('coverage_by_aspect', {}).items():
-                    print(f"- {aspect}: {details.get('coverage_percentage', 0)}% complete")
-                    await assistant.check_aspect_completion(session, aspect)
-                # Check for improvement
-                if overall - previous_overall < 2 and iteration > 3:
-                    print("No significant improvement detected; breaking loop early.")
+                overall_progress = (sum(assistant.state['coverage'].values()) / 
+                                  len(assistant.state['coverage']) if assistant.state['coverage'] else 0)
+                print(f"\nResearch Progress: {overall_progress}%")
+                
+                print("\nCurrent Coverage:")
+                for aspect, coverage in assistant.state['coverage'].items():
+                    aspect_scores = assistant.state['research_quality'].get('aspect_scores', {}).get(aspect, [])
+                    quality = 0
+                    if aspect_scores:
+                        total_scores = sum(float(v) for score_dict in aspect_scores 
+                                        for v in score_dict.values() if isinstance(v, (int, float)))
+                        score_count = sum(1 for score_dict in aspect_scores 
+                                        for v in score_dict.values() if isinstance(v, (int, float)))
+                        quality = total_scores / score_count if score_count > 0 else 0
+                    print(f"- {aspect}: {coverage}% (Quality: {quality:.1f}/10)")
+
+                if overall_progress >= 90:
+                    print("\n✨ All research aspects have reached 90% coverage!")
                     break
-                previous_overall = overall
 
-                queries = await assistant.generate_targeted_queries(session)
-                if not queries:
-                    print("No new queries generated. Proceeding to final report.")
-                    break
+                # Process aspects concurrently
+                incomplete_aspects = [
+                    aspect for aspect in assistant.state["aspects"].keys()
+                    if assistant.state["coverage"].get(aspect, 0) < 90
+                ]
 
-                print("\n📝 Executing targeted queries:")
-                for query_info in queries:
-                    await assistant.process_query_safely(session, query_info)
+                # Create tasks for all incomplete aspects
+                async def research_with_semaphore(aspect):
+                    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+                    async with semaphore:
+                        return await assistant.research_aspect(session, aspect, iteration)
 
-            return await assistant.ensure_final_report(session)
-    except Exception as e:
-        error_msg = f"Critical error in research process: {str(e)}"
-        if assistant:
-            assistant.research_state["error_log"].append(error_msg)
-        print(error_msg)
-        if assistant and session and not session.closed:
-            return await assistant.ensure_final_report(session)
-        return "Critical error occurred, unable to generate report."
-    finally:
-        if session and not session.closed:
-            await session.close()
+                tasks = [research_with_semaphore(aspect) for aspect in incomplete_aspects]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process results and update top sources
+                for aspect, result in zip(incomplete_aspects, results):
+                    if isinstance(result, bool) and result:
+                        # Update top sources tracking
+                        aspect_sources = [s for s in assistant.state.get('processed_urls', set())
+                                       if s not in top_sources_by_aspect[aspect]]
+                        if aspect_sources:
+                            top_sources_by_aspect[aspect].extend(aspect_sources)
+                            top_sources_by_aspect[aspect] = top_sources_by_aspect[aspect][:5]
+
+                iteration += 1
+
+            # After main research, perform deep analysis on top sources concurrently
+            print("\n🔍 Performing deep analysis on most relevant sources...")
+            analysis_tasks = []
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+            for aspect, sources in top_sources_by_aspect.items():
+                if sources:
+                    async def analyze_aspect_sources():
+                        async with semaphore:
+                            print(f"\nAnalyzing top sources for {aspect}...")
+                            return await assistant.perform_deep_analysis(
+                                session, 
+                                aspect, 
+                                [{"url": url} for url in sources[:3]]
+                            )
+                    analysis_tasks.append(analyze_aspect_sources())
+
+            detailed_findings_list = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+            
+            # Process successful analyses
+            for aspect, findings in zip(top_sources_by_aspect.keys(), detailed_findings_list):
+                if isinstance(findings, list) and findings:
+                    assistant.state['findings'][aspect].extend(
+                        finding.get('analysis', {}).get('comprehensive_findings', [])
+                        for finding in findings
+                    )
+
+            print("\n📚 Generating comprehensive academic report...")
+            return await assistant.generate_academic_report(session)
+
+        except Exception as e:
+            print(f"❌ Critical error: {str(e)}")
+            for err in assistant.state.get("errors", []):
+                print(f"   - {err}")
+            if assistant.state.get('findings'):
+                return assistant._format_raw_findings()
+            return f"Research failed: {str(e)}"
 
 if __name__ == "__main__":
     try:
-        goal = input("Enter your research goal: ")
-        asyncio.run(conduct_research(goal))
+        question = input("Enter your research question: ")
+        report = asyncio.run(conduct_research(question))
+        if report:
+            print("\n🎯 Final Research Report:")
+            print(report)
     except KeyboardInterrupt:
         print("\n\nResearch interrupted by user.")
     except Exception as e:
