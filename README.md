@@ -66,10 +66,37 @@
 >>    os.environ['SERPAPI_API_KEY'] = 'your_serpapi_key_here'
 >>    os.environ['JINA_API_KEY'] = 'your_jina_key_here'
 >>    ```
->>    Replace `'your_openrouter_key_here'`, `'your_serpapi_key_here'`, and `'your_jina_key_here'` with your actual API keys.
+>>    Replace `'your_openrouter_key_here'`, `'your_serpapi_key_here'`, and `'your_jina_key_here'` with your actual API keys. See below for how to obtain these.
 >> 
 >> 4. **Paste the ResearchAssistant Code**  
 >>    Copy the entire code (from your provided script) into a new code cell. This includes all imports, the `ResearchAssistant` class, and the `conduct_research` function.
+>> 
+>> ### Obtaining API Keys
+>> Below are instructions for getting the necessary API keys and what each service does.
+>> 
+>> #### OpenRouter API Key
+>> - **What It’s For**: OpenRouter provides access to various large language models (e.g., Claude, GPT-3.5) through a single API. The Research Assistant uses it to analyze queries, generate search terms, and process findings.
+>> - **How to Get It**:
+>>   1. Visit [openrouter.ai](https://openrouter.ai) and sign up with your email or wallet.
+>>   2. Log in, then go to [openrouter.ai/keys](https://openrouter.ai/keys).
+>>   3. Click "Create Key", name it (e.g., "ResearchAssistant"), and optionally set a credit limit.
+>>   4. Copy the key immediately—it won’t be shown again. Add credits via the account page if needed.
+>> 
+>> #### SerpAPI API Key
+>> - **What It’s For**: SerpAPI enables searching Google Scholar and other engines programmatically. The Research Assistant uses it to find academic sources relevant to your query.
+>> - **How to Get It**:
+>>   1. Go to [serpapi.com](https://serpapi.com) and create an account.
+>>   2. After logging in, navigate to the "Dashboard" or "Your Account" section.
+>>   3. Find your API key under the "API Key" or "Account" tab and copy it.
+>>   4. SerpAPI offers a free tier with limited searches; upgrade for more capacity if needed.
+>> 
+>> #### Jina AI API Key
+>> - **What It’s For**: Jina AI extracts clean, LLM-friendly text from web pages (e.g., converting HTML to Markdown). The Research Assistant uses it as a fallback to fetch content from paywalled or complex sites.
+>> - **How to Get It**:
+>>   1. Sign up at [jina.ai](https://jina.ai).
+>>   2. Log in, then go to the "API" or "Developer" section (check the dashboard).
+>>   3. Generate an API key—look for a "Create API Key" or similar option.
+>>   4. Copy the key. Jina offers a free tier; check their pricing for higher limits.
 >> 
 >> ## 💻 Usage in Colab
 >> 
