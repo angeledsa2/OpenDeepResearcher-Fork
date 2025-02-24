@@ -4,7 +4,6 @@ import json
 import re
 from typing import Dict, List, Optional
 import os
-from datetime import datetime
 
 # If running in an environment with an already-running event loop (e.g. Jupyter/Colab), patch it.
 try:
@@ -26,23 +25,6 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 SERPAPI_URL = "https://serpapi.com/search"
 JINA_BASE_URL = "https://r.jina.ai/"
 
-class PaywallException(Exception):
-    """Custom exception for paywall detection"""
-    def __init__(self, url: str, reason: str):
-        self.url = url
-        self.reason = reason
-        self.message = f"Paywall detected at {url}: {reason}"
-        super().__init__(self.message)
-
-    def __str__(self) -> str:
-        return f"🔒 Paywall at {self.url} (reason: {self.reason})"
-
-    def get_details(self) -> Dict:
-        return {
-            "url": self.url,
-            "reason": self.reason,
-            "timestamp": datetime.now().isoformat()
-        }
 
 class ResearchAssistant:
     def __init__(self):
@@ -70,7 +52,8 @@ class ResearchAssistant:
                 "queries_attempted": set(),
                 "successful_queries": [],
                 "failed_queries": []
-            }
+            },
+            "aspect_queries": {}  # New addition
         }
 
 
@@ -79,12 +62,12 @@ class ResearchAssistant:
         self.state["request"] = request
         prompt = (
             f"Analyze this research request thoroughly:\n{request}\n\n"
-            "Break it down into research aspects, each with:\n"
+            "Break it down into targeted research aspects for academic review, each with:\n"
             "- Key concepts and search terms\n"
-            "- Required evidence types\n"
+            "- Required evidence type\n"
             "- Success criteria\n"
             "- Credibility requirements\n\n"
-            "Format as JSON with clear aspect names as keys.\n"
+            "Format as JSON with clear aspect names as keys. The aspect names should clearly capture and communicate the core questions we're researching.\n"
             "Each aspect should have: concepts, evidence_types, criteria, credibility_requirements"
         )
         print("DEBUG: Sending the following prompt to LLM for research analysis:")
@@ -114,7 +97,10 @@ class ResearchAssistant:
             return False
 
     async def _call_llm(self, session: aiohttp.ClientSession, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """Make LLM API call with robust response handling and retries for overloaded conditions."""
+        """
+        Makes an API call to the configured LLM endpoint with the given prompt.
+        Handles retries, rate limits, and returns the LLM's text response if successful.
+        """
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "HTTP-Referer": "http://localhost:8000",
@@ -124,7 +110,7 @@ class ResearchAssistant:
         payload = {
             "model": DEFAULT_MODEL,
             "messages": [
-                {"role": "system", "content": "You are a precise research assistant."},
+                {"role": "system", "content": "You are a precise research assistant performing critical academic research."},
                 {"role": "user", "content": prompt}
             ]
         }
@@ -163,85 +149,159 @@ class ResearchAssistant:
                 return None
         return None
 
-    async def generate_search_query(self, session: aiohttp.ClientSession, aspect: str, findings: List[str]) -> Optional[str]:
-        """
-        Generate focused search queries using LLM. Allows one complex operator and handles query validation.
-        Returns a query string optimized for academic search.
-        """
+    async def generate_search_query(self, session, aspect, findings):
+        # Step 1: Extract key entities from the original question
+        entity_prompt = (
+            f"Extract the 3-5 most critical concepts or entities (nouns, key terms) from this research question:\n"
+            f"{self.state['request']}\n\n"
+            "Return a JSON list of terms, e.g., ['term1', 'term2', 'term3']."
+        )
+        entities = await self._call_llm(session, entity_prompt)
+        try:
+            key_terms = json.loads(entities) if entities else []
+        except Exception:
+            key_terms = ["unknown"]  # Fallback if parsing fails
+
+        # Step 2: Build the main query prompt
         prompt = (
-            f"Create ONE search query for research on:\n"
-            f"Topic: {aspect}\n"
-            f"Research Area: {json.dumps(self.state['aspects'].get(aspect, {}))}\n\n"
+            f"Create ONE focused search query for research on:\n"
+            f"Full Research Question: {self.state['request']}\n"
+            f"Specific Aspect: {aspect}\n"
+            f"Aspect Details: {json.dumps(self.state['aspects'].get(aspect, {}))}\n"
+            f"Key Terms from Question (must include at least two): {json.dumps(key_terms)}\n"
+            f"Prior Findings (refine based on these if present): {json.dumps(findings[:3]) if findings else 'None'}\n\n"
             "Requirements:\n"
-            "1. Use 2-4 key concepts\n"
-            "2. You may use ONE Boolean operator (AND, OR) if needed\n"
-            "3. Include essential synonyms in parentheses if needed\n"
-            "4. Focus on academic/scientific sources\n\n"
-            "Return ONLY the search query string without quotes or explanations."
+            "1. Use 3-5 key terms, including at least two from the key terms list\n"
+            "2. At most one Boolean operator (AND/OR)\n"
+            "3. Keep it simple, scientific, and directly tied to the full question and aspect\n"
+            "4. Put multi-word terms in quotes\n"
+            "5. Avoid generic terms unless paired with key question concepts\n\n"
+            "Return ONLY the search query string."
         )
         try:
             query = await self._call_llm(session, prompt)
-            if query:
-                query = query.strip().strip('"\'')
-                words = query.split()
-                # Allow 2-10 words to accommodate Boolean operators
-                if 2 <= len(words) <= 10 and len(query) >= 3:
-                    # Check if query has at most one Boolean operator
-                    upper_query = query.upper()
-                    boolean_count = upper_query.count(" AND ") + upper_query.count(" OR ")
-                    if boolean_count <= 1:
-                        print(f"🔍 Generated query: {query}")
-                        self.state['progress']['queries_attempted'].add(query)
-                        return query
-                    else:
-                        print(f"⚠️ Too many Boolean operators ({boolean_count})")
-                else:
-                    print(f"⚠️ Query length outside bounds ({len(words)} words)")
-                
-                # Retry with simpler prompt if needed
-                retry_prompt = (
-                    f"Generate ONE simple search query for: {aspect}\n"
-                    "Use 2-4 key terms and at most one Boolean operator (AND/OR).\n"
-                    "Return only the search terms."
-                )
-                retry_query = await self._call_llm(session, retry_prompt)
-                if retry_query:
-                    retry_query = retry_query.strip().strip('"\'')
-                    if 2 <= len(retry_query.split()) <= 10:
-                        return retry_query
+            if query and self._validate_query(query, key_terms):
+                print(f"🔍 Generated query: {query}")
+                self.state['progress']['queries_attempted'].add(query)
+                return query.strip().strip('"\'')
+            
+            # Fallback with stricter guidance
+            retry_prompt = (
+                f"Generate ONE simple 2-3 word search query for: {aspect}\n"
+                f"Full Research Question: {self.state['request']}\n"
+                f"Must include at least one of: {json.dumps(key_terms)}\n"
+                "Keep it tied to the question."
+            )
+            retry_query = await self._call_llm(session, retry_prompt)
+            if retry_query and self._validate_query(retry_query, key_terms):
+                print(f"🔍 Retry query: {retry_query}")
+                return retry_query.strip().strip('"\'')
         except Exception as e:
-            self.state["errors"].append(f"Query generation failed: {str(e)}")
-            print(f"❌ Query error: {str(e)}")
+            print(f"❌ Query generation error: {str(e)}")
         return None
+        
+    def _validate_query(self, query: str, key_terms: List[str]) -> bool:
+        """
+        Validates a generated query against certain constraints:
+
+        1) Tokenizes the query to identify terms and quoted phrases for counting.
+        2) Ensures we do not exceed eight total terms.
+        3) Permits at most one Boolean operator (AND/OR).
+        4) Requires at least one key term match (case-insensitive partial match).
+        5) Prints a rejection message and returns False if the query fails any constraint.
+
+        Returns:
+        True if the query passes all checks, otherwise False.
+        """
+        import re
+
+        # --- Step 1: Split into tokens and track quotes ---
+        terms = []
+        current_term = []
+        in_quotes = False
+
+        for word in query.split():
+            if '"' in word:
+                quotes_count = word.count('"')
+                # Toggle in_quotes if we see an odd number of quotes in this token
+                if quotes_count % 2 == 1:
+                    in_quotes = not in_quotes
+
+            if in_quotes:
+                # Accumulate words until closing quote
+                current_term.append(word)
+            else:
+                # If we exit quotes, store the accumulated phrase
+                if current_term:
+                    terms.append(" ".join(current_term))
+                    current_term = []
+                # Exclude Boolean operators from being counted as 'terms'
+                if word.upper() not in ("AND", "OR"):
+                    terms.append(word)
+
+        # If something remains in current_term, push it as a separate token
+        if current_term:
+            terms.append(" ".join(current_term))
+
+        # Clean up leading/trailing whitespace and count Boolean operators
+        terms = [term.strip() for term in terms if term.strip()]
+        upper_query = query.upper()
+        boolean_count = upper_query.count(" AND ") + upper_query.count(" OR ")
+
+        # --- Step 2: Check partial key term matches in the entire cleaned query ---
+        # Remove punctuation and uppercase everything for easier substring matching
+        cleaned_query = re.sub(r"[^\w\s]", "", upper_query)
+
+        key_terms_upper = [kt.upper() for kt in key_terms]
+        matched_terms = 0
+        for kt in key_terms_upper:
+            # Strip punctuation from the key term as well
+            cleaned_kt = re.sub(r"[^\w\s]", "", kt)
+            if cleaned_kt and cleaned_kt in cleaned_query:
+                matched_terms += 1
+
+        # --- Step 3: Verify constraints ---
+        # - Up to 8 terms
+        # - At most 1 Boolean operator
+        # - At least 1 key term match
+        is_valid = (
+            len(terms) <= 8 and
+            boolean_count <= 1 and
+            matched_terms >= 1
+        )
+
+        if not is_valid:
+            print(f"⚠️ Query rejected: {query} (Key terms matched: {matched_terms}/1 required)")
+        return is_valid
+
+
     
     async def process_research_results(self, session: aiohttp.ClientSession, urls: List[str], aspect: str) -> List[Dict]:
-        """
-        Process research results with improved methodology. Focuses on extracting key findings
-        while maintaining relevancy tracking for further analysis.
-        """
-        # Limit to 5 results per research area
-        urls = urls[:5]
+        query = self.state.get('aspect_queries', {}).get(aspect, None)  # Retrieve the query for this aspect
         results = []
-        
+
         for url in urls:
             if url in self.state["processed_urls"]:
                 continue
-                
+
             try:
                 content = await self.fetch_content(session, url)
                 if not content:
                     continue
-                    
+
+                # Modify the prompt to include the query, handling cases where query might be None
+                query_str = f" with the search query: {query}" if query else ""
                 analysis_prompt = (
-                    f"Analyze this content for {aspect}:\n"
+                    f"Review this content for its relevancy to {aspect} {query_str}\n"
                     f"{content[:3000]}\n\n"
-                    "Provide JSON with:\n"
+                    "Your entire response must be valid JSON. Return only JSON, with no additional text outside the JSON.\n"
+                    "Include the following fields:\n"
                     "1. relevance_score (0-10)\n"
                     "2. key_findings (array of relevant findings)\n"
                     "3. citation_info (title, authors, year, journal)\n"
-                    "Only include findings directly relevant to our research aspect."
+                    f"Only include findings directly relevant to research on {aspect} {(' and the search query' if query else '')}. key_findings should be a comprehensive answer to, or significant insight for, our research. Unless the content is highly relevant to our  {aspect} {(' and the search query' if query else '')}, keep key_findings to a maximum of 3 items. If the key_findings do not directly answer or have strong significance to our research {aspect} {(' and the search query' if query else '')}, do not score relevance higher than 3.\n"
                 )
-                
+
                 analysis = await self._call_llm(session, analysis_prompt)
                 if analysis:
                     try:
@@ -252,43 +312,49 @@ class ResearchAssistant:
                             "key_findings": data.get("key_findings", []),
                             "citation_info": data.get("citation_info", {})
                         }
-                        
+
                         # Track citation for later use
                         if result["citation_info"]:
                             self._track_citation(result["citation_info"])
-                        
+
                         # Store findings if relevance score is above threshold
-                        if result["relevance_score"] >= 6:
+                        if result["relevance_score"] >= 5:
                             self.state["findings"].setdefault(aspect, []).extend(result["key_findings"])
-                            
+
                         results.append(result)
                         self.state["processed_urls"].add(url)
-                        
+
                         # Log progress
                         print(f"\n📄 Processed: {url}")
                         print(f"Relevance: {result['relevance_score']}/10")
-                        if result["key_findings"]:
-                            print("Key Findings:")
-                            for finding in result["key_findings"][:2]:  # Show first 2 findings
-                                print(f"- {finding}")
-                            if len(result["key_findings"]) > 2:
-                                print(f"... and {len(result['key_findings'])-2} more findings")
-                                
+                  #      if result["key_findings"]:
+                  #          print("Key Findings:")
+                  #          for finding in result["key_findings"][:4]:  # Show first 4 findings
+                  #              print(f"- {finding}")
+                  #          if len(result["key_findings"]) > 2:
+                  #              print(f"... and {len(result['key_findings'])-2} more findings")
+
                     except json.JSONDecodeError:
                         print(f"⚠️ Failed to parse analysis for {url}")
-                        
+
             except Exception as e:
                 print(f"❌ Processing error for {url}: {str(e)}")
                 self.state["errors"].append(f"Result processing failed: {str(e)}")
-                
+
         # Sort by relevance and return top results
         return sorted(results, key=lambda x: x["relevance_score"], reverse=True)
 
-    async def perform_deep_analysis(self, session: aiohttp.ClientSession, aspect: str, top_results: List[Dict], max_results: int = 3) -> List[Dict]:
+    async def perform_deep_analysis(self, session: aiohttp.ClientSession, aspect: str, top_results: List[Dict], max_results: int = 5) -> List[Dict]:
         """
-        Perform deeper analysis on the most relevant results for each research aspect.
+        Performs a deeper analysis of the most relevant URLs for a given aspect.
+        Instructs the LLM to return valid JSON with the following numeric fields:
+        - methodology_quality (0–10)
+        - evidence_strength (0–10)
+        If the article has limited data, the LLM is prompted to estimate these values rather
+        than default to zero. This helps ensure coverage and quality stats get updated.
         """
-        top_results = top_results[:max_results]  # Limit to top 3 most relevant
+        query = self.state.get('aspect_queries', {}).get(aspect, None)
+        top_results = top_results[:max_results]  # Limit to top 5 most relevant
         detailed_findings = []
         
         for result in top_results:
@@ -296,35 +362,69 @@ class ResearchAssistant:
                 content = await self.fetch_content(session, result["url"])
                 if not content:
                     continue
-                    
+                
+                # Modified the prompt to force non-zero numeric fields in a 0–10 range
+                query_str = f" with the search query: {query}" if query else ""
                 detailed_prompt = (
-                    f"Perform detailed analysis for {aspect}:\n"
-                    f"{content[:4000]}\n\n"
-                    "Provide JSON with:\n"
-                    "1. comprehensive_findings (detailed findings with evidence)\n"
-                    "2. methodology_quality (0-10)\n"
-                    "3. evidence_strength (0-10)\n"
-                    "4. limitations\n"
-                    "5. implications\n"
-                    "Focus on evidence quality and research implications."
+                    f"Perform detailed, academic-grade research analysis on the subject {aspect}{query_str}:\n"
+                    f"{content[:40000]}\n\n"
+                    "Your entire response must be valid JSON. Return only JSON, with no extra text.\n"
+                    "Include these fields:\n"
+                    "1. comprehensive_findings (string)\n"
+                    "2. methodology_quality (0–10 numeric)\n"
+                    "3. evidence_strength (0–10 numeric)\n"
+                    "4. limitations (array of strings)\n"
+                    "5. implications (array of strings)\n"
+                    "If you cannot find enough detail, estimate or infer numeric values.\n"
+                    "DO NOT add data, findings, or presumptions not present in the content.\n"
+                    "Do NOT wrap the JSON in backticks or disclaimers. Output JSON only."
                 )
                 
                 analysis = await self._call_llm(session, detailed_prompt)
                 if analysis:
-                    data = json.loads(analysis)
-                    detailed_findings.append({
-                        "url": result["url"],
-                        "citation_info": result["citation_info"],
-                        "analysis": data
-                    })
-                    
-                    print(f"\n🔍 Deep analysis completed for: {result['url']}")
-                    print(f"Quality: {data.get('methodology_quality', 0)}/10")
-                    print(f"Evidence Strength: {data.get('evidence_strength', 0)}/10")
-                    
+                    try:
+                        # NEW: debug print to see raw
+                       # print("\nDEBUG: Raw LLM deep-analysis text:\n", analysis)
+
+                        cleaned_json = self._clean_json_response(analysis)
+
+                        # NEW: debug print to see extracted JSON
+                        # print("DEBUG: JSON extracted:\n", cleaned_json)
+
+                        data = json.loads(cleaned_json)
+
+                        cleaned_json = self._clean_json_response(analysis)
+                        data = json.loads(cleaned_json)
+                        detailed_findings.append({
+                            "url": result["url"],
+                            "citation_info": result.get("citation_info", {}),
+                            "analysis": data
+                        })
+                        
+                        print(f"\n🔍 Deep analysis completed for: {result['url']}")
+                       # print(f"Quality: {data.get('methodology_quality', 0)}/10")
+                       # print(f"Evidence Strength: {data.get('evidence_strength', 0)}/10")
+                    except json.JSONDecodeError as je:
+                        print(f"⚠️ JSON parsing error in deep analysis: {str(je)}")
+                        # Create a minimal valid analysis to prevent research failure
+                        fallback_analysis = {
+                            "comprehensive_findings": ["Could not extract detailed findings"],
+                            "methodology_quality": 0,
+                            "evidence_strength": 0,
+                            "limitations": ["Analysis failed due to response format issues"],
+                            "implications": ["Further manual review recommended"]
+                        }
+                        detailed_findings.append({
+                            "url": result["url"],
+                            "citation_info": result.get("citation_info", {}),
+                            "analysis": fallback_analysis
+                        })
+                        print(f"⚠️ Using fallback analysis for: {result['url']}")
+                        
             except Exception as e:
-                print(f"❌ Deep analysis failed for {result['url']}: {str(e)}")
-                
+                print(f"❌ Deep analysis failed for {result.get('url', 'unknown URL')}: {str(e)}")
+                self.state["errors"].append(f"Deep analysis failed for {result.get('url', 'unknown URL')}: {str(e)}")
+                    
         return detailed_findings
 
     async def search_sources(self, session: aiohttp.ClientSession, query: str) -> List[str]:
@@ -373,91 +473,9 @@ class ResearchAssistant:
             print(f"❌ Search error: {error_msg}")
         return []
 
-    async def prioritize_sources(self, session: aiohttp.ClientSession, urls: List[str], aspect: str) -> List[Dict]:
-        """Prioritize sources using comprehensive LLM evaluation with robust priority parsing."""
-        prioritized = []
-        aspect_details = self.state['aspects'].get(aspect, {})
-        
-        for url in urls:
-            if url in self.state["processed_urls"]:
-                continue
-            try:
-                preview = await self._get_source_preview(session, url)
-                prompt = (
-                    f"Research Aspect: {aspect}\n"
-                    f"Required Evidence Types: {aspect_details.get('evidence_types', [])}\n"
-                    f"Quality Criteria: {aspect_details.get('criteria', [])}\n\n"
-                    f"Source URL: {url}\n"
-                    f"Preview: {preview}\n\n"
-                    "Rate source priority (1-10) based on:\n"
-                    "1. Relevance to research aspect\n"
-                    "2. Match with required evidence types\n"
-                    "3. Potential to meet quality criteria\n"
-                    "4. Scientific credibility indicators\n"
-                    "5. Data/methodology rigor signals\n\n"
-                    "Respond with: [priority number] | [one-sentence reasoning]"
-                )
-                
-                response = await self._call_llm(session, prompt)
-                if response:
-                    try:
-                        # First try to find a number at the start of the response
-                        import re
-                        number_match = re.search(r'^[^\d]*(\d+(?:\.\d+)?)', response)
-                        if not number_match:
-                            # If no number at start, look for any number
-                            number_match = re.search(r'(\d+(?:\.\d+)?)', response)
-                        
-                        if number_match:
-                            try:
-                                priority = float(number_match.group(1))
-                                priority = int(max(1, min(10, priority)))
-                                # Get everything after the number as reasoning
-                                reasoning = response[number_match.end():].strip()
-                                if '|' in reasoning:  # If there's a pipe, take everything after it
-                                    reasoning = reasoning.split('|', 1)[1].strip()
-                                
-                                prioritized.append({
-                                    "url": url,
-                                    "priority": priority,
-                                    "reasoning": reasoning or "No explicit reasoning provided",
-                                    "evidence_types": [et for et in aspect_details.get('evidence_types', []) 
-                                                    if et.lower() in preview.lower()],
-                                    "criteria_matched": [c for c in aspect_details.get('criteria', []) 
-                                                    if c.lower() in preview.lower()]
-                                })
-                                
-                                if priority >= 7:
-                                    print(f"🌟 High Priority ({priority}/10): {url}")
-                                    print(f"📋 Reason: {reasoning}")
-                                elif priority <= 3:
-                                    print(f"⚠️ Low Priority ({priority}/10): {url}")
-                            except ValueError:
-                                print(f"⚠️ Could not convert priority to number: {number_match.group(1)}")
-                                self.state["errors"].append(f"Priority conversion failed for {url}")
-                        else:
-                            print(f"⚠️ No priority number found in response: {response[:100]}...")
-                            self.state["errors"].append(f"No priority number found for {url}")
-                    except Exception as e:
-                        print(f"⚠️ Priority parsing error: {str(e)}")
-                        self.state["errors"].append(f"Priority parsing failed for {url}: {str(e)}")
-                        
-            except Exception as e:
-                self.state["errors"].append(f"Source prioritization failed for {url}: {str(e)}")
-                continue
-                
-        return sorted(prioritized,
-                    key=lambda x: (x['priority'], len(x['evidence_types']), len(x['criteria_matched'])),
-                    reverse=True)
+    
 
-    async def _get_source_preview(self, session: aiohttp.ClientSession, url: str) -> str:
-        """Get a preview of source content using fetch_preview."""
-        try:
-            preview = await self.fetch_preview(session, url)
-            return preview if preview else ""
-        except Exception as e:
-            print(f"⚠️ Preview fetch failed: {str(e)}")
-            return ""
+    
 
     async def analyze_failure(self, session: aiohttp.ClientSession, query_info: Dict, error: str) -> Dict:
         """Use LLM to analyze and recover from research failures."""
@@ -505,25 +523,33 @@ class ResearchAssistant:
             self.state["errors"].append(f"Failed to handle failed query: {str(e)}")
             print(f"❌ Error handling failed query: {str(e)}")
 
-    async def _analyze_content(self, session: aiohttp.ClientSession, content: str, aspect: str) -> Dict:
-        """Perform a single LLM call that both evaluates relevance and extracts full research analysis."""
-        prompt = (
-            f"Analyze this content thoroughly:\n"
-            f"Research Aspect: {aspect}\n"
-            f"Content: {content[:3000]}\n\n"
-            "Extract the following:\n"
-            "1. Relevance score (0-10) for this content regarding the research aspect\n"
-            "2. Key findings relevant to the research (each with: finding, confidence (0-10), evidence_strength (0-10), novelty (0-10))\n"
-            "3. Quality assessment: {{ methodology: 0-10, evidence: 0-10, novelty: 0-10, rigor: 0-10 }}\n"
-            "4. Citation info: {{ title, authors, year, journal, doi }}\n\n"
-            "Return JSON with the fields: relevance_score, key_findings, quality_assessment, citation_info."
-        )
-        try:
-            analysis = await self._call_llm(session, prompt)
-            return json.loads(analysis) if analysis else {}
-        except Exception as e:
-            print(f"❌ Analysis error: {str(e)}")
-            return {}
+
+    def _clean_json_response(self, response: str) -> str:
+        """
+        Attempts to extract valid JSON from an LLM response by searching
+        for the first '{' and last '}' only. Then we do minimal cleanup:
+        - Remove triple backticks if present
+        - Strip leading/trailing whitespace
+        We do NOT re-quote keys or do heavy regex replacements. We rely on
+        the LLM to provide correct JSON.
+
+        Returns a JSON string or '{}' if it cannot be properly extracted.
+        """
+        # Debug print to see raw LLM text
+        # print("\nDEBUG: Raw LLM response for JSON:\n", response)
+
+        # Remove triple backticks if present
+        response = response.replace("```json", "").replace("```", "").strip()
+
+        start = response.find('{')
+        end = response.rfind('}')
+
+        if start == -1 or end == -1 or end <= start:
+            # If we never find a real JSON block, return empty
+            return "{}"
+
+        json_str = response[start:end+1].strip()
+        return json_str
 
     async def fetch_content(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """Fetch content with enhanced error handling and retry logic."""
@@ -531,26 +557,26 @@ class ResearchAssistant:
         backoff_delay = 1
         for attempt in range(max_retries):
             print(f"\n🔍 Attempting to fetch: {url} (Attempt {attempt + 1}/{max_retries})")
-            print("📡 Attempting direct access...")
+            # print("📡 Attempting direct access...")
             try:
                 async with session.get(url, timeout=30) as resp:
                     if resp.status == 200:
                         content = await resp.text(errors='ignore')
                         if content:
-                            print("✅ Direct access successful")
+                            # print("✅ Direct access successful")
                             cleaned_content = self._clean_content(content)
                             if cleaned_content:
                                 return cleaned_content
                             print("⚠️ Content cleaning failed, retrying...")
                         else:
-                            print("⚠️ Empty content received")
+                             print("⚠️ Empty content received")
                     else:
                         print(f"⚠️ Direct access failed with status: {resp.status}")
                         if resp.status in [403, 404, 410]:
                             break
                 if attempt < max_retries - 1:
                     delay = backoff_delay * (2 ** attempt)
-                    print(f"⏳ Waiting {delay} seconds before retry...")
+                    # print(f"⏳ Waiting {delay} seconds before retry...")
                     await asyncio.sleep(delay)
             except asyncio.TimeoutError:
                 print("⚠️ Request timed out")
@@ -560,7 +586,7 @@ class ResearchAssistant:
                 self.state["errors"].append(f"Direct access failed: {str(e)}")
                 if isinstance(e, (aiohttp.ClientPayloadError, aiohttp.ClientOSError)):
                     break
-        print("🔄 Attempting JINA API access...")
+        # print("🔄 Attempting JINA API access...")
         try:
             jina_url = f"{JINA_BASE_URL}{url}"
             headers = {"Authorization": f"Bearer {JINA_API_KEY}"}
@@ -588,43 +614,34 @@ class ResearchAssistant:
 
     def _clean_content(self, text: str) -> Optional[str]:
         """
-        Clean content with enhanced HTML handling and better text normalization.
-        Removes scripts, styles, and other non-content elements.
+        Clean content with enhanced text extraction and validation.
+        Handles HTML, PDFs, and plain text with improved content preservation.
         """
         if not text:
             return None
-        
+            
         try:
-            # First remove common HTML elements that don't contain useful content
-            html_patterns = [
-                r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>',  # Remove scripts
-                r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>',     # Remove styles
-                r'<nav\b[^>]*>.*?<\/nav>',                             # Remove navigation
-                r'<header\b[^>]*>.*?<\/header>',                       # Remove headers
-                r'<footer\b[^>]*>.*?<\/footer>',                       # Remove footers
-                r'<!--.*?-->',                                         # Remove comments
-                r'<!\[CDATA\[.*?\]\]>',                               # Remove CDATA
-                r'<select\b[^>]*>.*?<\/select>'                       # Remove select elements
-            ]
+            # First detect if content is HTML-like
+            is_html = bool(re.search(r'<[^>]+>', text))
             
-            cleaned = text
-            for pattern in html_patterns:
-                cleaned = re.sub(pattern, ' ', cleaned, flags=re.DOTALL | re.IGNORECASE)
-            
-            # Remove remaining HTML tags while preserving their content
-            cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
-            
+            if is_html:
+                # Extract text from HTML while preserving important content
+                cleaned = self._extract_html_content(text)
+            else:
+                cleaned = text
+                
             # Clean special characters and normalize whitespace
             cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\xFF]', '', cleaned)
             cleaned = re.sub(r'&[a-zA-Z]+;', ' ', cleaned)  # Remove HTML entities
+            
+            # Normalize whitespace while preserving paragraph breaks
+            cleaned = re.sub(r'\s*\n\s*\n\s*', '\n\n', cleaned)
             cleaned = re.sub(r'\s+', ' ', cleaned)
             
             # Remove common noise
             noise_patterns = [
                 r'\[PDF\]|\[HTML\]|\[CITATION\]',
                 r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                r'[""'']',
-                r'[–—]',
                 r'cookie[s]?\s+policy',
                 r'privacy\s+policy',
                 r'terms\s+of\s+service',
@@ -641,17 +658,62 @@ class ResearchAssistant:
             # Final cleanup
             cleaned = cleaned.strip()
             
-            # Verify minimum content length and meaningful content
-            if len(cleaned) < 50 or not re.search(r'[a-zA-Z]{3,}', cleaned):
-                print("⚠️ Cleaned content too short or lacks meaningful text")
+            # Verify content quality
+            if self._validate_content_quality(cleaned):
+                return cleaned
+            else:
+                print("⚠️ Content failed quality validation")
                 return None
                 
-            return cleaned
-            
         except Exception as e:
             print(f"❌ Content cleaning error: {str(e)}")
             self.state["errors"].append(f"Content cleaning failed: {str(e)}")
             return None
+
+    def _extract_html_content(self, html: str) -> str:
+        """Extract meaningful content from HTML while preserving structure."""
+        # Remove script and style elements
+        html = re.sub(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', '', html)
+        html = re.sub(r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>', '', html)
+        
+        # Remove navigation, headers, footers
+        html = re.sub(r'<nav\b[^>]*>.*?<\/nav>', '', html)
+        html = re.sub(r'<header\b[^>]*>.*?<\/header>', '', html)
+        html = re.sub(r'<footer\b[^>]*>.*?<\/footer>', '', html)
+        
+        # Preserve paragraph breaks
+        html = re.sub(r'</p>\s*<p>', '\n\n', html)
+        html = re.sub(r'<br\s*/?\s*>', '\n', html)
+        
+        # Remove remaining HTML tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        
+        return text
+
+    def _validate_content_quality(self, text: str) -> bool:
+        """
+        Validate cleaned content meets quality standards.
+        Returns True if content is valid for analysis.
+        """
+        if not text or len(text) < 50:
+            return False
+            
+        # Check for meaningful text (at least 3 letter words)
+        if not re.search(r'[a-zA-Z]{3,}', text):
+            return False
+            
+        # Check for reasonable text structure
+        words = text.split()
+        if len(words) < 10:  # Need at least 10 words
+            return False
+            
+        # Check for sentence structure
+        sentences = re.split(r'[.!?]+', text)
+        valid_sentences = [s.strip() for s in sentences if len(s.split()) > 3]
+        if not valid_sentences:
+            return False
+            
+        return True
 
     def _track_citation(self, citation_info: Dict) -> None:
         """Track citation with proper formatting."""
@@ -670,70 +732,7 @@ class ResearchAssistant:
         ]))
         self.state["citations"].add(citation)
 
-    async def fetch_preview(self, session: aiohttp.ClientSession, url: str, max_retries: int = 3) -> Optional[str]:
-        """
-        Fetch a preview of the content with enhanced error handling and retry logic.
-        Handles various HTTP status codes and implements exponential backoff.
-        """
-        headers = {
-            "Range": "bytes=0-2000",
-            "User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0; +http://example.com/bot)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        }
-        
-        for attempt in range(max_retries):
-            try:
-                async with session.get(url, headers=headers, timeout=10) as resp:
-                    if resp.status in (200, 206):
-                        content = await resp.text(errors='ignore')
-                        preview = self._clean_content(content)
-                        if preview:
-                            print(f"Preview for {url} (first 100 chars): {preview[:100]}...")
-                            return preview
-                        print(f"⚠️ No usable content found in preview for {url}")
-                    elif resp.status == 403:
-                        print(f"⚠️ Access forbidden for {url}")
-                        # Try alternative preview method using JINA
-                        try:
-                            jina_url = f"{JINA_BASE_URL}{url}"
-                            jina_headers = {"Authorization": f"Bearer {JINA_API_KEY}"}
-                            async with session.get(jina_url, headers=jina_headers, timeout=10) as jina_resp:
-                                if jina_resp.status == 200:
-                                    content = await jina_resp.text(errors='ignore')
-                                    preview = self._clean_content(content)
-                                    if preview:
-                                        print(f"✅ JINA preview successful for {url}")
-                                        return preview
-                        except Exception as je:
-                            print(f"⚠️ JINA preview failed: {str(je)}")
-                    elif resp.status == 429:  # Rate limit
-                        wait_time = 2 ** attempt
-                        print(f"⚠️ Rate limited, waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        print(f"⚠️ Preview fetch failed with status {resp.status} for {url}")
-                
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    print(f"Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(wait_time)
-                    
-            except asyncio.TimeoutError:
-                print(f"⚠️ Timeout fetching preview for {url}")
-                if attempt < max_retries - 1:
-                    continue
-            except Exception as e:
-                error_msg = f"Preview fetch failed for {url}: {str(e)}"
-                self.state["errors"].append(error_msg)
-                print(f"⚠️ {error_msg}")
-                if attempt < max_retries - 1:
-                    continue
-                else:
-                    break
-        
-        return None
-
+    
     async def research_aspect(self, session: aiohttp.ClientSession, aspect: str, iteration: int) -> bool:
         """
         Perform one iteration of researching a given aspect using improved methodology.
@@ -742,7 +741,7 @@ class ResearchAssistant:
         print(f"\n📊 Research Progress for {aspect}")
         print(f"Current Coverage: {self.state['coverage'].get(aspect, 0)}%")
         print(f"Successful Findings: {len(self.state['findings'].get(aspect, []))}")
-        print(f"Failed Attempts: {len([q for q in self.state['progress']['failed_queries'] if q['aspect'] == aspect])}")
+        # print(f"Failed Attempts: {len([q for q in self.state['progress']['failed_queries'] if q['aspect'] == aspect])}")
 
         try:
             # Generate and execute search query
@@ -751,7 +750,8 @@ class ResearchAssistant:
                 return False
 
             self.state['progress']['queries_attempted'].add(query)
-            print(f"\n📚 Researching {aspect} (Iteration {iteration})")
+            self.state['aspect_queries'][aspect] = query  # Store the query for this aspect
+            print(f"\n📚 Researching {aspect} ---- (Iteration {iteration})")
             print(f"🔍 Query: {query}")
             
             # Get search results
@@ -764,15 +764,16 @@ class ResearchAssistant:
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
             async def process_with_semaphore(url):
                 async with semaphore:
-                    return await self.process_research_results(session, [url], aspect)
+                    results = await self.process_research_results(session, [url], aspect)
+                    return results[0] if results else None  # Return first result or None
 
             tasks = [process_with_semaphore(url) for url in urls[:5]]  # Limit to 5 results
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Filter out exceptions and flatten results
+            # Filter out exceptions and None results
             valid_results = [
-                result[0] for result in results 
-                if isinstance(result, list) and result and not isinstance(result, Exception)
+                result for result in results 
+                if result and not isinstance(result, Exception)  # Changed from result[0]
             ]
 
             if not valid_results:
@@ -840,81 +841,9 @@ class ResearchAssistant:
             print(f"❌ Research error: {str(e)}")
             return False
         
-    async def process_url(self, session: aiohttp.ClientSession, url: str, aspect: str) -> Optional[Dict]:
-        """Process URL with emphasis on thorough review."""
-        if url in self.state["processed_urls"]:
-            print(f"⏭️ Already processed: {url}")
-            return None
-        print(f"\n📖 Processing: {url}")
-        try:
-            content = await self.fetch_content(session, url)
-            if not content:
-                print("❌ Could not fetch content")
-                return None
-            # In this merged approach, we call _analyze_content directly,
-            # which evaluates relevance and extracts findings.
-            analysis = await self._analyze_content(session, content, aspect)
-            if analysis and 'key_findings' in analysis:
-                self.state['findings'].setdefault(aspect, []).extend(analysis['key_findings'])
-                print(f"✨ Added {len(analysis['key_findings'])} findings")
-            self._track_citation({
-                "url": url,
-                "title": analysis.get('title', ''),
-                "authors": analysis.get('authors', []),
-                "year": analysis.get('year'),
-                "journal": analysis.get('journal')
-            })
-            self.state["processed_urls"].add(url)
-            return analysis
-        except Exception as e:
-            print(f"❌ Processing error: {str(e)}")
-            self.state["errors"].append(f"URL processing failed: {str(e)}")
-        return None
+    
 
-    async def generate_interim_report(self, session: aiohttp.ClientSession, aspect: str) -> str:
-        """Generate detailed interim report for a research aspect."""
-        analysis_prompt = (
-            f"Analyze research progress for aspect: {aspect}\n"
-            f"Findings: {json.dumps(self.state['findings'].get(aspect, []))}\n"
-            f"Coverage: {self.state['coverage'].get(aspect, 0)}%\n"
-            f"Quality Scores: {json.dumps(self.state['research_quality']['aspect_scores'].get(aspect, []))}\n"
-            f"Studies: {json.dumps([s for s in self.state['studies']['high_relevance'] if aspect in s.get('relevance_scores', {})])}\n\n"
-            "Provide detailed JSON analysis with:\n"
-            "1. key_findings_synthesis\n"
-            "2. evidence_quality_assessment\n"
-            "3. remaining_gaps\n"
-            "4. research_recommendations\n"
-            "5. potential_biases"
-        )
-        try:
-            analysis = await self._call_llm(session, analysis_prompt)
-            if not analysis:
-                raise ValueError("Analysis failed")
-            analyzed = json.loads(analysis)
-            report_prompt = (
-                f"Generate interim research report using this analysis:\n"
-                f"{json.dumps(analyzed)}\n\n"
-                "Format as markdown with sections:\n"
-                "1. Current Progress\n"
-                "2. Key Findings\n"
-                "3. Evidence Quality\n"
-                "4. Gaps and Limitations\n"
-                "5. Next Steps\n\n"
-                "Include relevant citations and quality metrics."
-            )
-            report = await self._call_llm(session, report_prompt)
-            if report:
-                return report
-        except Exception as e:
-            self.state["errors"].append(f"Interim report generation failed for {aspect}: {str(e)}")
-        return (
-            f"# Interim Report: {aspect}\n\n"
-            f"## Current Progress\nCoverage: {self.state['coverage'].get(aspect, 0)}%\n\n"
-            f"## Key Findings\n" + "\n".join(f"- {finding}" for finding in self.state['findings'].get(aspect, [])) +
-            "\n\n## Evidence Quality\nBased on {len(self.state['research_quality']['aspect_scores'].get(aspect, []))} evaluated sources\n\n"
-            "## Gaps and Limitations\n- Report generation failed, showing raw findings\n\n"
-            "## Next Steps\n- Continue research to improve coverage\n- Attempt report generation again"
-        )
+    
 
     async def generate_academic_report(self, session: aiohttp.ClientSession) -> str:
         """Generate comprehensive executive report with citations in one step."""
@@ -941,13 +870,14 @@ class ResearchAssistant:
                 f"Citations: {json.dumps(citations, ensure_ascii=False)}\n"
                 f"Coverage: {json.dumps(coverage, ensure_ascii=False)}\n"
                 f"Quality Metrics: {json.dumps(quality_metrics, ensure_ascii=False)}\n\n"
-                "Create a professional executive report with:\n"
+                "Create a detailed, comprehensive academic report with:\n"
                 "1. Executive Summary (key findings and implications)\n"
                 "2. Research Overview\n"
                 "3. Key Findings by Research Aspect\n"
                 "4. Evidence Quality and Limitations\n"
                 "5. References\n\n"
                 "Requirements:\n"
+                "- DO NOT make assumptions or add your own knowledge to the report - solely use the findings made available to you here. \n"
                 "- Use clear, professional language\n"
                 "- Include relevant citations [Author, Year]\n"
                 "- Highlight strength of evidence\n"
@@ -995,23 +925,21 @@ class ResearchAssistant:
             ])
         return "\n".join(sections)
 
-    def display_relevant_studies(self, aspect: str, studies: List[Dict]) -> None:
-        """Display relevant studies for an aspect."""
-        relevant = [study for study in studies if aspect.lower() in study.get('title', '').lower()]
-        if relevant:
-            print(f"\n📚 Relevant Studies for {aspect}:")
-            for study in relevant[:3]:
-                print(f"- {study['title']}")
-                print(f"  Quality: {study['quality_score']:.1f}/10")
-            print(f"  Relevance: {study['relevance_score']:.1f}/10")
 
-    def _safe_json_parse(self, text: str) -> Dict:
-        """Safely parse JSON with error handling."""
+
+        
+    def calculate_quality_score(self, aspect_scores: List[Dict]) -> float:
+        """Calculate normalized quality score from aspect scores."""
         try:
-            return json.loads(text)
-        except json.JSONDecodeError as e:
-            self.state["errors"].append(f"JSON parsing failed: {str(e)}")
-            return {}
+            # Flatten and validate scores
+            all_scores = [
+                float(v) for score_dict in aspect_scores 
+                for v in score_dict.values() 
+                if isinstance(v, (int, float)) and 0 <= float(v) <= 10
+            ]
+            return sum(all_scores) / len(all_scores) if all_scores else 0
+        except Exception:
+            return 0
 
 async def conduct_research(question: str) -> Optional[str]:
     """
@@ -1037,20 +965,14 @@ async def conduct_research(question: str) -> Optional[str]:
             iteration = 1
             while iteration <= 10:
                 print(f"\n🔄 Iteration {iteration}")
-                overall_progress = (sum(assistant.state['coverage'].values()) / 
-                                  len(assistant.state['coverage']) if assistant.state['coverage'] else 0)
+                coverage_values = [v for v in assistant.state['coverage'].values() if isinstance(v, (int, float))]
+                overall_progress = (sum(coverage_values) / len(coverage_values)) if coverage_values else 0
                 print(f"\nResearch Progress: {overall_progress}%")
                 
                 print("\nCurrent Coverage:")
                 for aspect, coverage in assistant.state['coverage'].items():
                     aspect_scores = assistant.state['research_quality'].get('aspect_scores', {}).get(aspect, [])
-                    quality = 0
-                    if aspect_scores:
-                        total_scores = sum(float(v) for score_dict in aspect_scores 
-                                        for v in score_dict.values() if isinstance(v, (int, float)))
-                        score_count = sum(1 for score_dict in aspect_scores 
-                                        for v in score_dict.values() if isinstance(v, (int, float)))
-                        quality = total_scores / score_count if score_count > 0 else 0
+                    quality = assistant.calculate_quality_score(aspect_scores)  # Use the class method
                     print(f"- {aspect}: {coverage}% (Quality: {quality:.1f}/10)")
 
                 if overall_progress >= 90:
@@ -1064,13 +986,17 @@ async def conduct_research(question: str) -> Optional[str]:
                 ]
 
                 # Create tasks for all incomplete aspects
+                semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)  # Create once at top level
                 async def research_with_semaphore(aspect):
-                    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
                     async with semaphore:
                         return await assistant.research_aspect(session, aspect, iteration)
 
                 tasks = [research_with_semaphore(aspect) for aspect in incomplete_aspects]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    results = await asyncio.gather(*tasks)
+                except Exception as e:
+                    print(f"❌ Task error: {str(e)}")
+                    results = []
 
                 # Process results and update top sources
                 for aspect, result in zip(incomplete_aspects, results):
