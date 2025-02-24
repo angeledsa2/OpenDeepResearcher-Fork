@@ -38,51 +38,77 @@
 >> - Identified contradictions and gaps
 >> - Top-priority studies with citations
 >> 
->> ## ⚙️ Setup
+>> ## ⚙️ Setup in Google Colab
+>> 
 >> ### Requirements
->> - Python 3.8+
+>> - A Google Colab notebook (free tier works fine)
 >> - API Keys:
->>   * OpenRouter (LLM queries)
->>   * SERPAPI (Academic search)
->>   * JINA (Content extraction)
+>>   - OpenRouter (for LLM queries)
+>>   - SERPAPI (for academic search)
+>>   - JINA (for content extraction)
 >> 
->> ### Installation
->> ```bash
->> git clone https://github.com/angeledsa2/OpenDeepResearcher-Fork.git
->> cd OpenDeepResearcher-Fork
->> ```
+>> ### Step-by-Step Setup
+>> 1. **Open a New Colab Notebook**  
+>>    Go to [Google Colab](https://colab.research.google.com/), sign in with your Google account, and create a new notebook.
 >> 
->> ### Configure API Keys
->> ```bash
->> export OPENROUTER_API_KEY="your_key"
->> export SERPAPI_API_KEY="your_key"
->> export JINA_API_KEY="your_key"
->> ```
+>> 2. **Install Dependencies**  
+>>    In a code cell, run the following to install required packages:
+>>    ```bash
+>>    !pip install aiohttp nest_asyncio
+>>    ```
 >> 
->> ## 💻 Usage
->> ### Basic Research:
+>> 3. **Set Up API Keys**  
+>>    In a new code cell, securely define your API keys (avoid sharing them publicly):
+>>    ```python
+>>    import os
+>> 
+>>    os.environ['OPENROUTER_API_KEY'] = 'your_openrouter_key_here'
+>>    os.environ['SERPAPI_API_KEY'] = 'your_serpapi_key_here'
+>>    os.environ['JINA_API_KEY'] = 'your_jina_key_here'
+>>    ```
+>>    Replace `'your_openrouter_key_here'`, `'your_serpapi_key_here'`, and `'your_jina_key_here'` with your actual API keys.
+>> 
+>> 4. **Paste the ResearchAssistant Code**  
+>>    Copy the entire code (from your provided script) into a new code cell. This includes all imports, the `ResearchAssistant` class, and the `conduct_research` function.
+>> 
+>> ## 💻 Usage in Colab
+>> 
+>> ### Basic Research
+>> In a new code cell, run the research assistant:
 >> ```python
->> from research_assistant import ResearchAssistant
+>> import asyncio
 >> 
->> assistant = ResearchAssistant()
+>> # Define your research question
+>> question = "Analyze the impact of remote work adoption on organizational productivity and employee well-being."
 >> 
->> goal = """Analyze the impact of remote work adoption on organizational productivity and employee well-being."""
+>> # Run the research (Colab handles async automatically with nest_asyncio)
+>> report = asyncio.run(conduct_research(question))
 >> 
->> result = await assistant.conduct_research(goal)
->> print(result)
+>> # Display the report
+>> print(report)
 >> ```
 >> 
->> ### Advanced Configuration:
+>> ### Advanced Configuration
+>> For custom settings, configure the assistant before running:
 >> ```python
->> assistant = ResearchAssistant(
->>     max_concurrent_requests=5,
->>     default_model="anthropic/claude-3.5-sonnet",
->>     min_evidence_quality=7
->> )
+>> import asyncio
 >> 
->> goal = """Examine the effectiveness of ML approaches in disease detection using medical imaging."""
->> result = await assistant.conduct_research(goal)
+>> # Advanced configuration
+>> async def run_research():
+>>     assistant = ResearchAssistant()
+>>     # Optionally adjust settings in the code (e.g., MAX_CONCURRENT_REQUESTS=5)
+>>     question = "Examine the effectiveness of ML approaches in disease detection using medical imaging."
+>>     return await conduct_research(question)
+>> 
+>> # Execute and display
+>> report = asyncio.run(run_research())
+>> print(report)
 >> ```
+>> 
+>> ### Notes for Colab
+>> - **Async Support**: The code uses `nest_asyncio` to handle Colab’s existing event loop. No additional setup is needed.
+>> - **Execution**: Run cells sequentially. If you get a "Runtime disconnected" error, reduce `MAX_CONCURRENT_REQUESTS` (e.g., to 3) in the code to lower resource usage.
+>> - **Output**: Results appear in the cell output below your code.
 >> 
 >> ## 🔧 Key Enhancements (v2.1)
 >> - **LLM-Driven Query Generation:** Improved search query generation using OpenRouter LLM.
@@ -113,15 +139,14 @@
 >> - Maximum content length of 5000 characters per source
 >> 
 >> ## 🤝 Contributing
->> Visit github.com/angeledsa2/OpenDeepResearcher-Fork for contributions.
+>> Visit [github.com/angeledsa2/OpenDeepResearcher-Fork](https://github.com/angeledsa2/OpenDeepResearcher-Fork) for contributions.
 >> 
 >> ## 📜 License
 >> MIT License - See LICENSE.md
->> ```
-
- ---
-
- Original Concept: Based on OpenDeepResearcher by Matt Shumer
- Fork Maintainer: @angeledsa2
-
- > Note: This is an autonomous research tool. Always verify critical findings through additional sources.
+>> 
+>> ---
+>> 
+>> **Original Concept:** Based on OpenDeepResearcher by Matt Shumer  
+>> **Fork Maintainer:** @angeledsa2  
+>> 
+>> **Note:** This is an autonomous research tool. Always verify critical findings through additional sources.
